@@ -155,7 +155,7 @@ pub struct ScrapeRequest {
     #[schemars(description = "Include extracted links (default true, max 50)")]
     #[serde(default)]
     pub include_links: Option<bool>,
-    #[schemars(description = "Pagination offset into markdown (like Hound's next_offset)")]
+    #[schemars(description = "Pagination offset into markdown for reading subsequent chunks")]
     #[serde(default)]
     pub offset: Option<usize>,
     // deprecated top-level (kept for compat, prefer options.*)
@@ -253,7 +253,7 @@ pub struct ScrapeResult {
     pub links: Vec<LinkOut>,
     /// Headings as table-of-contents
     pub headings: Vec<String>,
-    /// Next offset for pagination if truncated (like Hound's next_offset)
+    /// Next offset for pagination if truncated
     #[serde(default)]
     #[schemars(description = "Next offset for pagination if truncated")]
     pub next_offset: Option<usize>,
