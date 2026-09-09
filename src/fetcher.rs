@@ -34,6 +34,7 @@ pub struct Fetched {
     /// shell looks identical to success.
     pub escalated: bool,
     /// Status from the cheap tier, kept for diagnostics after escalation.
+    #[allow(dead_code)]
     pub first_status: u16,
 }
 

@@ -76,11 +76,10 @@ fn visible_text_len(html: &str) -> usize {
         if b[i] == b'<' {
             in_tag = true;
         }
-        if !in_tag && !in_script && b[i] != b'>' {
-            if !b[i].is_ascii_whitespace() {
+        if !in_tag && !in_script && b[i] != b'>'
+            && !b[i].is_ascii_whitespace() {
                 len += 1;
             }
-        }
         if b[i] == b'>' {
             in_tag = false;
         }
@@ -94,7 +93,7 @@ fn extract_links(html: &str, base_url: &str) -> Vec<Link> {
     let sel = a_href_sel();
     let base = url::Url::parse(base_url).ok();
     let mut links = Vec::new();
-    for el in doc.select(&sel) {
+    for el in doc.select(sel) {
         let href = el.value().attr("href").unwrap_or("").trim();
         if href.is_empty() || href.starts_with('#') || href.starts_with("javascript:") {
             continue;
@@ -228,7 +227,7 @@ pub fn extract(html: &str, url: &str) -> Result<CleanDoc> {
         || markdown_primary.trim().len() < 200 && visible_len > 600
         || primary_text_len < (visible_len as f64 * 0.25) as usize && visible_len > 1000;
 
-    let (mut title, mut markdown, mut clean_html, mut text) = if needs_fallback {
+    let (title, mut markdown, clean_html, mut text) = if needs_fallback {
         // Fallback: clean full HTML and convert – captures lists, feeds, index pages
         let fallback_clean = ammonia::clean(html);
         let mut fallback_md = html2md::parse_html(&fallback_clean);

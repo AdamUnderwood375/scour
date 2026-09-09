@@ -6,9 +6,11 @@
 //! Frontier upgrade: article + list fallback, links/page_type, BM25 focus,
 //! batch parallelism, and in-domain crawl.
 
+mod cache;
 mod extractor;
 mod fetcher;
 
+use cache::{cache_get, cache_key, cache_key_ext, cache_set};
 use rmcp::{
     ErrorData, ServerHandler,
     handler::server::wrapper::{Json, Parameters},
@@ -16,100 +18,8 @@ use rmcp::{
     schemars, tool, tool_handler, tool_router,
 };
 use std::collections::{HashMap, HashSet, VecDeque};
-use std::path::PathBuf;
-use std::sync::{Mutex, OnceLock};
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
-
-// ── Cache: in-memory LRU + persistent file cache (1hr TTL) ─────────────────
-static CACHE: OnceLock<Mutex<HashMap<String, (Instant, ScrapeResult)>>> = OnceLock::new();
-fn cache() -> &'static Mutex<HashMap<String, (Instant, ScrapeResult)>> {
-    CACHE.get_or_init(|| Mutex::new(HashMap::new()))
-}
-fn cache_key(url: &str, focus: Option<&str>, max_chars: usize) -> String {
-    format!("{}|{}|{}", url, focus.unwrap_or(""), max_chars)
-}
-fn cache_key_ext(
-    url: &str,
-    focus: Option<&str>,
-    max_chars: usize,
-    offset: Option<usize>,
-    include_media: bool,
-    pages: Option<&str>,
-    actions_len: usize,
-) -> String {
-    format!(
-        "{}|{}|{}|{}|{}|{}|{}",
-        url,
-        focus.unwrap_or(""),
-        max_chars,
-        offset.unwrap_or(0),
-        include_media,
-        pages.unwrap_or(""),
-        actions_len
-    )
-}
-fn cache_file_path() -> PathBuf {
-    let base = std::env::var("HOME").unwrap_or_else(|_| "/home/adam-underwood".to_string());
-    PathBuf::from(base).join(".cache").join("scour").join("cache.json")
-}
-fn now_secs() -> u64 {
-    SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs()
-}
-fn file_cache_get(key: &str) -> Option<ScrapeResult> {
-    let path = cache_file_path();
-    let data = std::fs::read_to_string(&path).ok()?;
-    let map: HashMap<String, (u64, ScrapeResult)> = serde_json::from_str(&data).ok()?;
-    let (ts, val) = map.get(key)?;
-    if now_secs().saturating_sub(*ts) < 3600 {
-        Some(val.clone())
-    } else { None }
-}
-fn file_cache_set(key: String, val: &ScrapeResult) {
-    let path = cache_file_path();
-    let mut map: HashMap<String, (u64, ScrapeResult)> = std::fs::read_to_string(&path)
-        .ok()
-        .and_then(|d| serde_json::from_str(&d).ok())
-        .unwrap_or_default();
-    map.insert(key, (now_secs(), val.clone()));
-    if map.len() > 200 {
-        let keys: Vec<String> = map.keys().cloned().collect();
-        for k in keys.into_iter().take(map.len() - 200) {
-            map.remove(&k);
-        }
-    }
-    if let Some(parent) = path.parent() {
-        let _ = std::fs::create_dir_all(parent);
-    }
-    if let Ok(json) = serde_json::to_string(&map) {
-        let _ = std::fs::write(&path, json);
-    }
-}
-fn cache_get(key: &str) -> Option<ScrapeResult> {
-    {
-        if let Ok(guard) = cache().lock() {
-            if let Some((when, val)) = guard.get(key) {
-                if when.elapsed() < Duration::from_secs(3600) {
-                    return Some(val.clone());
-                }
-            }
-        }
-    }
-    if let Some(val) = file_cache_get(key) {
-        if let Ok(mut g) = cache().lock() {
-            if g.len() > 200 { g.clear(); }
-            g.insert(key.to_string(), (Instant::now(), val.clone()));
-        }
-        return Some(val);
-    }
-    None
-}
-fn cache_set(key: String, val: ScrapeResult) {
-    if let Ok(mut g) = cache().lock() {
-        if g.len() > 200 { g.clear(); }
-        g.insert(key.clone(), (Instant::now(), val.clone()));
-    }
-    file_cache_set(key, &val);
-}
+use std::sync::OnceLock;
+use std::time::Duration;
 
 // ── Request / Response types ────────────────────────────────────────────────
 
@@ -318,6 +228,7 @@ pub struct SearchResult {
 
 #[derive(Clone)]
 struct Scour {
+    #[allow(dead_code)]
     tool_router: rmcp::handler::server::router::tool::ToolRouter<Self>,
 }
 
@@ -407,7 +318,7 @@ impl Scour {
         &self,
         Parameters(req): Parameters<CrawlRequest>,
     ) -> Result<Json<CrawlResult>, ErrorData> {
-        let max_pages = req.max_pages.unwrap_or(5).min(20).max(1);
+        let max_pages = req.max_pages.unwrap_or(5).clamp(1, 20);
         let max_depth = req.max_depth.unwrap_or(2).min(4);
         let max_chars = req.max_chars.unwrap_or(8000);
         let res = crawl_run(&req.url, max_pages, max_depth, req.focus.as_deref(), max_chars, req.sitemap, req.discover_only, req.max_total_chars)
@@ -418,9 +329,7 @@ impl Scour {
 
     #[tool(description = "Clear the in-memory fetch cache (1hr TTL). Use to force a fresh fetch.")]
     async fn cache_clear(&self) -> Result<Json<serde_json::Value>, ErrorData> {
-        if let Ok(mut g) = cache().lock() { g.clear(); }
-        let path = cache_file_path();
-        let _ = std::fs::remove_file(&path);
+        cache::cache_clear();
         Ok(Json(serde_json::json!({"cleared": true})))
     }
 
@@ -429,7 +338,7 @@ impl Scour {
         &self,
         Parameters(req): Parameters<SearchRequest>,
     ) -> Result<Json<SearchResult>, ErrorData> {
-        let max = req.max_results.unwrap_or(10).min(20).max(1);
+        let max = req.max_results.unwrap_or(10).clamp(1, 20);
         let hits = search_run(
             &req.query,
             max,
@@ -483,8 +392,8 @@ fn validate(url: &str) -> anyhow::Result<()> {
         "http" | "https" => {},
         s => anyhow::bail!("refusing non-http scheme: {s}"),
     }
-    if let Some(host) = u.host_str() {
-        if let Ok(ip) = host.parse::<std::net::IpAddr>() {
+    if let Some(host) = u.host_str()
+        && let Ok(ip) = host.parse::<std::net::IpAddr>() {
             let is_private = match ip {
                 std::net::IpAddr::V4(v4) => v4.is_private(),
                 std::net::IpAddr::V6(v6) => v6.is_unique_local(),
@@ -497,7 +406,6 @@ fn validate(url: &str) -> anyhow::Result<()> {
                 anyhow::bail!("refusing private/loopback/link-local IP: {host}");
             }
         }
-    }
     Ok(())
 }
 
@@ -750,6 +658,7 @@ async fn run(url: &str, focus: Option<&str>, max_chars: usize, include_links: bo
     run_ext(url, focus, max_chars, include_links, None, false, None, None).await
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn run_ext(
     url: &str,
     focus: Option<&str>,
@@ -896,32 +805,30 @@ async fn fetch_sitemap_urls(domain: &str) -> Vec<String> {
     let mut result = Vec::new();
     for path in &["sitemap.xml", "sitemap_index.xml"] {
         let url = format!("https://{}/{}", domain, path);
-        if let Ok(resp) = client.get(&url).send().await {
-            if resp.status().is_success() {
-                if let Ok(text) = resp.text().await {
+        if let Ok(resp) = client.get(&url).send().await
+            && resp.status().is_success()
+                && let Ok(text) = resp.text().await {
                     let mut start = 0;
                     while let Some(open) = text[start..].find("<loc>") {
                         let open_idx = start + open + 5;
                         if let Some(close) = text[open_idx..].find("</loc>") {
                             let close_idx = open_idx + close;
                             let loc = text[open_idx..close_idx].trim().to_string();
-                            if let Ok(u) = url::Url::parse(&loc) {
-                                if u.host_str() == Some(domain) {
+                            if let Ok(u) = url::Url::parse(&loc)
+                                && u.host_str() == Some(domain) {
                                     result.push(loc);
                                 }
-                            }
                             start = close_idx + 6;
                         } else { break; }
                     }
                 }
-            }
-        }
     }
     result.sort();
     result.dedup();
     result
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn crawl_run(start_url: &str, max_pages: usize, max_depth: usize, focus: Option<&str>, max_chars: usize, sitemap: Option<bool>, discover_only: Option<bool>, max_total_chars: Option<usize>) -> anyhow::Result<CrawlResult> {
     validate(start_url)?;
     let start_domain = url::Url::parse(start_url)?.host_str().unwrap_or("").to_string();
@@ -936,9 +843,8 @@ async fn crawl_run(start_url: &str, max_pages: usize, max_depth: usize, focus: O
             let mut visited: HashSet<String> = HashSet::new();
             let mut total_chars = 0usize;
             for url in sitemap_urls.into_iter().take(max_pages) {
-                if let Some(limit) = max_total_chars {
-                    if total_chars >= limit { break; }
-                }
+                if let Some(limit) = max_total_chars
+                    && total_chars >= limit { break; }
                 let norm = normalize_url(&url);
                 if !visited.insert(norm) { continue; }
                 if pages.len() >= max_pages { break; }
@@ -964,17 +870,15 @@ async fn crawl_run(start_url: &str, max_pages: usize, max_depth: usize, focus: O
         while let Some((url, depth)) = queue.pop_front() {
             if visited.len() >= max_pages { break; }
             if depth > max_depth { continue; }
-            if let Some(limit) = max_total_chars {
-                if total_chars >= limit { break; }
-            }
+            if let Some(limit) = max_total_chars
+                && total_chars >= limit { break; }
             let doc = match run(&url, focus, max_chars, true).await {
                 Ok(d) => d,
                 Err(_) => continue,
             };
             total_chars += doc.markdown.len();
-            if let Some(limit) = max_total_chars {
-                if total_chars > limit { break; }
-            }
+            if let Some(limit) = max_total_chars
+                && total_chars > limit { break; }
             if depth < max_depth && visited.len() < max_pages {
                 for link in &doc.links {
                     let href = &link.href;
@@ -1004,9 +908,8 @@ async fn crawl_run(start_url: &str, max_pages: usize, max_depth: usize, focus: O
     while let Some((url, depth)) = queue.pop_front() {
         if pages.len() >= max_pages { break; }
         if depth > max_depth { continue; }
-        if let Some(limit) = max_total_chars {
-            if total_chars >= limit { break; }
-        }
+        if let Some(limit) = max_total_chars
+            && total_chars >= limit { break; }
         let res = run(&url, focus, max_chars, true).await;
         let doc = match res {
             Ok(d) => d,
@@ -1083,7 +986,7 @@ async fn search_run(
     exclude_sites: Option<&[String]>,
     freshness: Option<&str>,
 ) -> anyhow::Result<Vec<SearchHit>> {
-    let max_results = max_results.min(20).max(1);
+    let max_results = max_results.clamp(1, 20);
     let client = fetcher::client();
     let mut effective = query.to_string();
     if let Some(s) = site {
@@ -1136,11 +1039,10 @@ async fn search_run(
             for el in doc.select(search_a_href_sel()) {
                 let mut href = el.value().attr("href").unwrap_or("").trim().to_string();
                 if href.starts_with("//") { href = format!("https:{}", href); }
-                if href.contains("duckduckgo.com/l/?") {
-                    if let Some(enc) = href.split("uddg=").nth(1).and_then(|s| s.split('&').next()) {
+                if href.contains("duckduckgo.com/l/?")
+                    && let Some(enc) = href.split("uddg=").nth(1).and_then(|s| s.split('&').next()) {
                         href = urlencoding_decode(enc);
                     }
-                }
                 if !href.starts_with("http") { continue; }
                 if href.contains("duckduckgo.com") { continue; }
                 let title = el.text().collect::<Vec<_>>().join(" ").trim().to_string();
@@ -1155,16 +1057,14 @@ async fn search_run(
         let bdoc = scraper::Html::parse_document(&bhtml);
         for el in bdoc.select(bing_sel()) {
             let mut href = el.value().attr("href").unwrap_or("").trim().to_string();
-            if href.contains("bing.com/ck/a") {
-                if let Some(u) = href.split("u=").nth(1).and_then(|s| s.split('&').next()) {
-                    let mut b64 = if u.starts_with("a1") { u[2..].to_string() } else { u.to_string() };
+            if href.contains("bing.com/ck/a")
+                && let Some(u) = href.split("u=").nth(1).and_then(|s| s.split('&').next()) {
+                    let mut b64 = u.strip_prefix("a1").unwrap_or(u).to_string();
                     while b64.len() % 4 != 0 { b64.push('='); }
                     use base64::Engine as _;
-                    if let Ok(decoded) = base64::engine::general_purpose::STANDARD.decode(&b64) {
-                        if let Ok(s) = String::from_utf8(decoded) { href = s; }
-                    }
+                    if let Ok(decoded) = base64::engine::general_purpose::STANDARD.decode(&b64)
+                        && let Ok(s) = String::from_utf8(decoded) { href = s; }
                 }
-            }
             if !href.starts_with("http") { continue; }
             let title = el.text().collect::<Vec<_>>().join(" ").trim().to_string();
             if title.is_empty() { continue; }
@@ -1173,16 +1073,14 @@ async fn search_run(
         if bing_hits.is_empty() {
             for el in bdoc.select(bing_fallback_sel()) {
                     let mut href = el.value().attr("href").unwrap_or("").trim().to_string();
-                    if href.contains("bing.com/ck/a") {
-                        if let Some(u) = href.split("u=").nth(1).and_then(|s| s.split('&').next()) {
-                            let mut b64 = if u.starts_with("a1") { u[2..].to_string() } else { u.to_string() };
+                    if href.contains("bing.com/ck/a")
+                        && let Some(u) = href.split("u=").nth(1).and_then(|s| s.split('&').next()) {
+                            let mut b64 = u.strip_prefix("a1").unwrap_or(u).to_string();
                             while b64.len() % 4 != 0 { b64.push('='); }
                             use base64::Engine as _;
-                            if let Ok(decoded) = base64::engine::general_purpose::STANDARD.decode(&b64) {
-                                if let Ok(s) = String::from_utf8(decoded) { href = s; }
-                            }
+                            if let Ok(decoded) = base64::engine::general_purpose::STANDARD.decode(&b64)
+                                && let Ok(s) = String::from_utf8(decoded) { href = s; }
                         }
-                    }
                     if !href.starts_with("http") || href.contains("bing.com") { continue; }
                     let title = el.text().collect::<Vec<_>>().join(" ").trim().to_string();
                     if title.is_empty() || title.len() < 10 { continue; }
