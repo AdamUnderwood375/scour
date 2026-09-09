@@ -1,0 +1,19 @@
+name: CI
+on:
+  push:
+  pull_request:
+
+jobs:
+  ci:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - name: cargo test
+        run: cargo test
+      - name: clippy (-D warnings)
+        run: cargo clippy -- -D warnings
+      - name: build release
+        run: cargo build --release

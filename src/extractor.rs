@@ -4,6 +4,25 @@
 
 use anyhow::Result;
 use scraper::{Html, Selector};
+use std::sync::OnceLock;
+
+static A_HREF_SEL: OnceLock<Selector> = OnceLock::new();
+static TITLE_SEL: OnceLock<Selector> = OnceLock::new();
+static META_DESC_SEL: OnceLock<Selector> = OnceLock::new();
+static BODY_SEL: OnceLock<Selector> = OnceLock::new();
+
+fn a_href_sel() -> &'static Selector {
+    A_HREF_SEL.get_or_init(|| Selector::parse("a[href]").unwrap())
+}
+fn title_sel() -> &'static Selector {
+    TITLE_SEL.get_or_init(|| Selector::parse("title").unwrap())
+}
+fn meta_desc_sel() -> &'static Selector {
+    META_DESC_SEL.get_or_init(|| Selector::parse(r#"meta[name="description"], meta[property="og:description"]"#).unwrap())
+}
+fn body_sel() -> &'static Selector {
+    BODY_SEL.get_or_init(|| Selector::parse("body").unwrap())
+}
 
 #[derive(Debug, serde::Serialize, Clone)]
 pub struct Link {
@@ -72,7 +91,7 @@ fn visible_text_len(html: &str) -> usize {
 
 fn extract_links(html: &str, base_url: &str) -> Vec<Link> {
     let doc = Html::parse_document(html);
-    let sel = Selector::parse("a[href]").unwrap();
+    let sel = a_href_sel();
     let base = url::Url::parse(base_url).ok();
     let mut links = Vec::new();
     for el in doc.select(&sel) {
@@ -106,10 +125,8 @@ fn extract_links(html: &str, base_url: &str) -> Vec<Link> {
 
 fn extract_meta(html: &str) -> (Option<String>, Option<String>) {
     let doc = Html::parse_document(html);
-    let title_sel = Selector::parse("title").unwrap();
-    let title = doc.select(&title_sel).next().map(|e| e.text().collect::<String>().trim().to_string()).filter(|s| !s.is_empty());
-    let desc_sel = Selector::parse(r#"meta[name="description"], meta[property="og:description"]"#).unwrap();
-    let desc = doc.select(&desc_sel).next().and_then(|e| e.value().attr("content")).map(|s| s.trim().to_string()).filter(|s| !s.is_empty());
+    let title = doc.select(title_sel()).next().map(|e| e.text().collect::<String>().trim().to_string()).filter(|s| !s.is_empty());
+    let desc = doc.select(meta_desc_sel()).next().and_then(|e| e.value().attr("content")).map(|s| s.trim().to_string()).filter(|s| !s.is_empty());
     (title, desc)
 }
 
@@ -124,9 +141,8 @@ fn generate_link_markdown(title: &str, links: &[Link], html: &str) -> String {
     // For list pages where html2md produced table garbage, build readable markdown from links + extracted body text
     let doc = Html::parse_document(html);
     // Extract visible body text (first 2000 chars, collapsed whitespace)
-    let body_sel = Selector::parse("body").unwrap();
     let body_text = doc
-        .select(&body_sel)
+        .select(body_sel())
         .next()
         .map(|b| b.text().collect::<Vec<_>>().join(" "))
         .unwrap_or_default();

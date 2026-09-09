@@ -2,6 +2,18 @@
 
 Local, Rust-only web scraper and search engine. Fetches clean markdown for single pages, batch scraping, BFS site crawl, keyless web search, BM25 focus, 1-hour cache, and Brave headless fallback when blocked.
 
+## Prerequisites
+
+- **Rust 1.85+** — required for `edition = "2024"` (`Cargo.toml`). Install via [rustup](https://rustup.rs/).
+- **Optional browser** — Brave or Chromium for JS/anti-bot fallback. Auto-detected at `/usr/bin/brave`, `/usr/bin/chromium`, etc. Override with `SCOUR_BROWSER=/path/to/brave`.
+- **Build & install**:
+
+  ```sh
+  cargo build --release          # binary at ./target/release/scour
+  cargo install --path .         # install to ~/.cargo/bin/scour
+  cargo test                     # run unit tests
+  ```
+
 ## Core Features
 
 - **Single-page extraction**: Fast fetches with instant in-memory and persistent file cache.
@@ -11,7 +23,7 @@ Local, Rust-only web scraper and search engine. Fetches clean markdown for singl
 - **In-domain crawl**: Same-domain BFS crawl prioritized by focus query.
 - **Keyless search**: Parallel DuckDuckGo HTML + Bing fallback with clean, decoded URLs.
 - **Cache**: 1-hour in-memory LRU + file cache (`~/.cache/scour/cache.json`).
-- **Anti-bot ladder**: Standard HTTP with Chrome UA; escalates to Brave headless (`/usr/bin/brave`) only on challenge detection (Cloudflare, interstitial blocks, JS app shells).
+- **Anti-bot ladder**: Standard HTTP with Chrome UA; escalates to Brave headless (`/usr/bin/brave` or `$SCOUR_BROWSER`) only on challenge detection (Cloudflare, interstitial blocks, JS app shells).
 - **Screenshot**: Headless screenshot capture returning base64 PNG.
 
 ---
@@ -36,17 +48,24 @@ cp skills/scour/SKILL.md ~/.pi/agent/skills/scour/
 
 ### How the Agent Uses It
 
-The agent uses its existing `bash` tool to invoke `scour`:
+The agent uses its existing `bash` tool to invoke `scour` (portable — no hardcoded user paths):
 
 ```bash
-# Fetch clean markdown
-~/scour/target/release/scour "https://example.com" 2>&1 | head -n 200
+# From a checkout (SCOUR_DIR is wherever you cloned the repo)
+SCOUR_DIR=/path/to/scour
+$SCOUR_DIR/target/release/scour "https://example.com" 2>&1 | head -n 200
+
+# Or via cargo run (no prior build step)
+cargo run --release -- "https://example.com" 2>&1 | head -n 200
 
 # Scrape with BM25 focus query
-~/scour/target/release/scour "https://react.dev/learn" "state" 2>&1 | head -n 200
+cargo run --release -- "https://react.dev/learn" "state" 2>&1 | head -n 200
 
 # Parallel batch fetch
-printf "%s\n" "https://example.com" "https://react.dev/learn" | xargs -P3 -I{} ~/scour/target/release/scour "{}" 2>&1
+printf "%s\n" "https://example.com" "https://react.dev/learn" | xargs -P3 -I{} sh -c 'cargo run --release -- "{}" 2>&1 | head -n 50'
+
+# If installed to PATH
+scour "https://example.com" 2>&1 | head -n 200
 ```
 
 The CLI prints the title on the first line, clean markdown on stdout, and metadata (`page_type`, `quality`, `links`) on stderr.
@@ -69,13 +88,21 @@ Escalation occurs only on explicit block signals: `401`/`403`/`429`/`503`, `<500
 ```sh
 cargo build --release
 
-# CLI smoke test
-./target/release/scour https://example.com
+# CLI smoke test (portable, no hardcoded absolute path)
+cargo run --release -- https://example.com
 
 # CLI with BM25 focus query
-./target/release/scour https://example.com "query"
+cargo run --release -- https://example.com "query"
+
+# Direct binary after build
+./target/release/scour https://example.com
+
+# Via $SCOUR_DIR checkout
+SCOUR_DIR=$(pwd) $SCOUR_DIR/target/release/scour https://example.com
 
 # Run as stdio MCP server
+cargo run --release --
+# or
 ./target/release/scour
 ```
 
@@ -83,17 +110,33 @@ cargo build --release
 
 ## MCP Tools (stdio)
 
-If you prefer structured MCP integration, add `scour` to your MCP configuration:
+If you prefer structured MCP integration, add `scour` to your MCP configuration (use a portable path):
 
 ```json
 {
   "mcpServers": {
     "scour": {
-      "command": "/home/adam-underwood/scour/target/release/scour"
+      "command": "/path/to/scour/target/release/scour",
+      "args": [],
+      "env": { "SCOUR_BROWSER": "/usr/bin/brave" }
     }
   }
 }
 ```
+
+Or with `cargo run` (dev) or `~/.cargo/bin/scour` after `cargo install --path .`:
+
+```json
+{
+  "mcpServers": {
+    "scour": {
+      "command": "scour"
+    }
+  }
+}
+```
+
+Set `SCOUR_DIR` to your checkout location, or use `cargo install --path .` and put `scour` on `PATH`.
 
 ### Available Tools
 

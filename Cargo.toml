@@ -2,6 +2,10 @@
 name = "scour"
 version = "0.1.0"
 edition = "2024"
+license = "MIT"
+description = "Fast local web scraper & search (Rust) — single-page, batch, crawl, BM25 focus, keyless search, 1-hour cache"
+repository = "https://github.com/AdamUnderwood375/scour"
+readme = "README.md"
 
 [dependencies]
 ammonia = "4.1.4"

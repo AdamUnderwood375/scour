@@ -480,9 +480,25 @@ impl ServerHandler for Scour {
 fn validate(url: &str) -> anyhow::Result<()> {
     let u = url::Url::parse(url)?;
     match u.scheme() {
-        "http" | "https" => Ok(()),
+        "http" | "https" => {},
         s => anyhow::bail!("refusing non-http scheme: {s}"),
     }
+    if let Some(host) = u.host_str() {
+        if let Ok(ip) = host.parse::<std::net::IpAddr>() {
+            let is_private = match ip {
+                std::net::IpAddr::V4(v4) => v4.is_private(),
+                std::net::IpAddr::V6(v6) => v6.is_unique_local(),
+            };
+            let is_link_local = match ip {
+                std::net::IpAddr::V4(v4) => v4.is_link_local(),
+                std::net::IpAddr::V6(v6) => v6.is_unicast_link_local(),
+            };
+            if ip.is_loopback() || ip.is_unspecified() || is_private || is_link_local {
+                anyhow::bail!("refusing private/loopback/link-local IP: {host}");
+            }
+        }
+    }
+    Ok(())
 }
 
 fn focus_filter(markdown: &str, query: &str, keep: usize) -> String {
@@ -564,13 +580,18 @@ fn slice_at_offset(s: &str, offset: usize) -> String {
     if idx < s.len() { s[idx..].to_string() } else { String::new() }
 }
 
+static IMG_SEL: OnceLock<scraper::Selector> = OnceLock::new();
+fn img_sel() -> &'static scraper::Selector {
+    IMG_SEL.get_or_init(|| scraper::Selector::parse("img[src]").unwrap())
+}
+
 fn extract_media(html: &str, base_url: &str) -> Vec<String> {
     let doc = scraper::Html::parse_document(html);
-    let sel = scraper::Selector::parse("img[src]").unwrap();
+    let sel = img_sel();
     let base = url::Url::parse(base_url).ok();
     let mut out = Vec::new();
     let mut seen = HashSet::new();
-    for el in doc.select(&sel) {
+    for el in doc.select(sel) {
         if let Some(src) = el.value().attr("src") {
             let src = src.trim();
             if src.is_empty() || src.starts_with("data:") { continue; }
@@ -871,10 +892,7 @@ async fn run_ext(
 }
 
 async fn fetch_sitemap_urls(domain: &str) -> Vec<String> {
-    let client = match reqwest::Client::builder().timeout(std::time::Duration::from_secs(8)).user_agent("Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36").build() {
-        Ok(c) => c,
-        Err(_) => return vec![],
-    };
+    let client = fetcher::client();
     let mut result = Vec::new();
     for path in &["sitemap.xml", "sitemap_index.xml"] {
         let url = format!("https://{}/{}", domain, path);
@@ -1045,6 +1063,19 @@ fn normalize_url(u: &str) -> String {
     } else { u.to_string() }
 }
 
+static DDG_TITLE_SEL: OnceLock<scraper::Selector> = OnceLock::new();
+static DDG_SNIPPET_SEL: OnceLock<scraper::Selector> = OnceLock::new();
+static DDG_RESULT_SEL: OnceLock<scraper::Selector> = OnceLock::new();
+static SEARCH_A_HREF_SEL: OnceLock<scraper::Selector> = OnceLock::new();
+static BING_SEL: OnceLock<scraper::Selector> = OnceLock::new();
+static BING_FALLBACK_SEL: OnceLock<scraper::Selector> = OnceLock::new();
+fn ddg_title_sel() -> &'static scraper::Selector { DDG_TITLE_SEL.get_or_init(|| scraper::Selector::parse("h2.result__title a").unwrap()) }
+fn ddg_snippet_sel() -> &'static scraper::Selector { DDG_SNIPPET_SEL.get_or_init(|| scraper::Selector::parse(".result__snippet").unwrap()) }
+fn ddg_result_sel() -> &'static scraper::Selector { DDG_RESULT_SEL.get_or_init(|| scraper::Selector::parse(".result").unwrap()) }
+fn search_a_href_sel() -> &'static scraper::Selector { SEARCH_A_HREF_SEL.get_or_init(|| scraper::Selector::parse("a[href]").unwrap()) }
+fn bing_sel() -> &'static scraper::Selector { BING_SEL.get_or_init(|| scraper::Selector::parse("li.b_algo h2 a").unwrap()) }
+fn bing_fallback_sel() -> &'static scraper::Selector { BING_FALLBACK_SEL.get_or_init(|| scraper::Selector::parse("h2 a[href]").unwrap()) }
+
 async fn search_run(
     query: &str,
     max_results: usize,
@@ -1089,24 +1120,20 @@ async fn search_run(
     let mut ddg_hits: Vec<SearchHit> = Vec::new();
     if let Ok(html) = ddg_html_res {
         let doc = scraper::Html::parse_document(&html);
-        let title_sel = scraper::Selector::parse("h2.result__title a").unwrap();
-        let snippet_sel = scraper::Selector::parse(".result__snippet").unwrap();
-        let result_sel = scraper::Selector::parse(".result").unwrap();
-        for result in doc.select(&result_sel) {
-            let Some(title_el) = result.select(&title_sel).next() else { continue; };
+        for result in doc.select(ddg_result_sel()) {
+            let Some(title_el) = result.select(ddg_title_sel()).next() else { continue; };
             let title = title_el.text().collect::<Vec<_>>().join(" ").trim().to_string();
             let href = title_el.value().attr("href").unwrap_or("").to_string();
             let url = if href.contains("uddg=") {
                 href.split("uddg=").nth(1).and_then(|s| s.split('&').next()).and_then(|u| url::Url::parse(&urlencoding_decode(u)).ok()).map(|u| u.to_string()).unwrap_or(href.clone())
             } else { href };
-            let snippet = result.select(&snippet_sel).next().map(|s| s.text().collect::<Vec<_>>().join(" ").trim().to_string()).unwrap_or_default();
+            let snippet = result.select(ddg_snippet_sel()).next().map(|s| s.text().collect::<Vec<_>>().join(" ").trim().to_string()).unwrap_or_default();
             if title.is_empty() || url.is_empty() { continue; }
             if !url.starts_with("http") { continue; }
             ddg_hits.push(SearchHit { title, url, snippet });
         }
         if ddg_hits.is_empty() {
-            let a_sel = scraper::Selector::parse("a[href]").unwrap();
-            for el in doc.select(&a_sel) {
+            for el in doc.select(search_a_href_sel()) {
                 let mut href = el.value().attr("href").unwrap_or("").trim().to_string();
                 if href.starts_with("//") { href = format!("https:{}", href); }
                 if href.contains("duckduckgo.com/l/?") {
@@ -1126,8 +1153,7 @@ async fn search_run(
     let mut bing_hits: Vec<SearchHit> = Vec::new();
     if let Ok(bhtml) = bing_html_res {
         let bdoc = scraper::Html::parse_document(&bhtml);
-        let b_sel = scraper::Selector::parse("li.b_algo h2 a").unwrap();
-        for el in bdoc.select(&b_sel) {
+        for el in bdoc.select(bing_sel()) {
             let mut href = el.value().attr("href").unwrap_or("").trim().to_string();
             if href.contains("bing.com/ck/a") {
                 if let Some(u) = href.split("u=").nth(1).and_then(|s| s.split('&').next()) {
@@ -1145,8 +1171,7 @@ async fn search_run(
             bing_hits.push(SearchHit { title, url: href, snippet: String::new() });
         }
         if bing_hits.is_empty() {
-            if let Ok(fallback_sel) = scraper::Selector::parse("h2 a[href]") {
-                for el in bdoc.select(&fallback_sel) {
+            for el in bdoc.select(bing_fallback_sel()) {
                     let mut href = el.value().attr("href").unwrap_or("").trim().to_string();
                     if href.contains("bing.com/ck/a") {
                         if let Some(u) = href.split("u=").nth(1).and_then(|s| s.split('&').next()) {
@@ -1163,7 +1188,6 @@ async fn search_run(
                     if title.is_empty() || title.len() < 10 { continue; }
                     bing_hits.push(SearchHit { title, url: href, snippet: String::new() });
                 }
-            }
         }
         drop(bdoc);
     }
