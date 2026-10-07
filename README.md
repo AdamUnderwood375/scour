@@ -1,116 +1,127 @@
-# scour — fast local web scraper & search (Rust)
+<div align="center">
 
-Local, Rust-only web scraper and search engine. Fetches clean markdown for single pages, batch scraping, BFS site crawl, keyless web search, BM25 focus, 1-hour cache, and Brave headless fallback when blocked.
+# scour
 
-## Prerequisites
+Fast, local, Rust-only web scraper: single pages, batch fetches, site crawls, and keyless search — as a CLI or a stdio MCP server.
 
-- **Rust 1.85+** — required for `edition = "2024"` (`Cargo.toml`). Install via [rustup](https://rustup.rs/).
-- **Optional browser** — Brave or Chromium for JS/anti-bot fallback. Auto-detected at `/usr/bin/brave`, `/usr/bin/chromium`, etc. Override with `SCOUR_BROWSER=/path/to/brave`.
-- **Build & install**:
+[![CI](https://github.com/AdamUnderwood375/scour/actions/workflows/ci.yml/badge.svg)](https://github.com/AdamUnderwood375/scour/actions/workflows/ci.yml) [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE) [![Rust](https://img.shields.io/badge/rust-edition_2024_%2F_1.85%2B-orange.svg)](https://github.com/AdamUnderwood375/scour) [![rust](https://img.shields.io/badge/topic-rust-lightgrey.svg)](https://github.com/AdamUnderwood375/scour) [![mcp](https://img.shields.io/badge/topic-mcp-lightgrey.svg)](https://github.com/AdamUnderwood375/scour)
 
-  ```sh
-  cargo build --release          # binary at ./target/release/scour
-  cargo install --path .         # install to ~/.cargo/bin/scour
-  cargo test                     # run unit tests
-  ```
+</div>
 
-## Core Features
+## What it is
 
-- **Single-page extraction**: Fast fetches with instant in-memory and persistent file cache.
-- **List & article awareness**: Extracts clean markdown with `page_type` detection (`article`, `list`, `media`), quality scoring, and link extraction without table garbage.
-- **BM25 Focus**: Query-driven relevance weighting + heading boost to pull specific sections from large documents.
-- **Batch scraping**: Parallel processing via `scrape_batch` (JoinSet).
-- **In-domain crawl**: Same-domain BFS crawl prioritized by focus query.
-- **Keyless search**: Parallel DuckDuckGo HTML + Bing fallback with clean, decoded URLs.
-- **Cache**: 1-hour in-memory LRU + file cache (`~/.cache/scour/cache.json`).
-- **Anti-bot ladder**: Standard HTTP with Chrome UA; escalates to Brave headless (`/usr/bin/brave` or `$SCOUR_BROWSER`) only on challenge detection (Cloudflare, interstitial blocks, JS app shells).
-- **Screenshot**: Headless screenshot capture returning base64 PNG.
+`scour` is one small Rust binary (~2,230 lines across `src/main.rs`, `src/fetcher.rs`, `src/cache.rs`, `src/extractor.rs`, edition 2024, MIT) that turns messy web pages into clean markdown for humans and agents. It fetches with plain HTTP when that works, escalates to a headless browser only when blocked, extracts the readable content, and optionally filters long documents down to the paragraphs that match your query.
 
----
-
-## Agent Skill Option (Save Tokens vs MCP)
-
-Running scrapers as MCP tools injects large tool schemas and documentation into the model's context window on every turn (~2,000–3,000 tokens overhead per session).
-
-With the **Pi Agent Skill**, your coding agent runs `scour` directly through standard CLI execution instead of registering an MCP server:
-- **0 MCP schema token tax** — saves ~2k–3k context tokens per session.
-- **Direct stdout pipes** — agents pipe output directly into `head`, `grep`, or file targets.
-- **Zero background daemon** — executes on demand and exits immediately.
-
-### Installing the Skill
-
-Copy `skills/scour/SKILL.md` to your Pi agent skills directory:
-
-```bash
-mkdir -p ~/.pi/agent/skills/scour
-cp skills/scour/SKILL.md ~/.pi/agent/skills/scour/
+```mermaid
+flowchart LR
+    URL[URL] --> Cache{Cache lookup<br/>1 h TTL}
+    Cache -- miss --> T1[Tier 1: reqwest HTTP]
+    Cache -- hit --> MD[Markdown + metadata]
+    T1 --> Blocked{Blocked?}
+    Blocked -- no --> Extract[readability-first extraction<br/>list fallback]
+    Blocked -- yes --> T2[Tier 2: headless Brave]
+    T2 --> Extract
+    Extract --> BM25{Focus query?}
+    BM25 -- yes --> Filter[BM25 focus filter]
+    BM25 -- no --> MD
+    Filter --> MD
 ```
 
-### How the Agent Uses It
+## Two ways to run it
 
-The agent uses its existing `bash` tool to invoke `scour` (portable — no hardcoded user paths):
+One binary, two modes, selected by arguments:
 
-```bash
-# From a checkout (SCOUR_DIR is wherever you cloned the repo)
-SCOUR_DIR=/path/to/scour
-$SCOUR_DIR/target/release/scour "https://example.com" 2>&1 | head -n 200
+- **CLI** — `scour <url> [focus]` prints the page title on line 1, clean markdown on stdout, and metadata (`page_type`, `quality`, links count, `next_offset`) on stderr. Starts in ~7 ms and exits when done; output pipes straight into `head` and `grep`.
+- **MCP server** — `scour` with no arguments runs a stdio MCP server exposing 7 tools (`scrape`, `scrape_batch`, `crawl`, `search`, `screenshot`, `cache_clear`, `scour_version`) for agents that want structured JSON.
 
-# Or via cargo run (no prior build step)
-cargo run --release -- "https://example.com" 2>&1 | head -n 200
+Use the CLI when you want text on stdout; use MCP when you want typed tool calls. The fetch pipeline underneath is identical.
 
-# Scrape with BM25 focus query
-cargo run --release -- "https://react.dev/learn" "state" 2>&1 | head -n 200
+## Why not just an MCP server
 
-# Parallel batch fetch
-printf "%s\n" "https://example.com" "https://react.dev/learn" | xargs -P3 -I{} sh -c 'cargo run --release -- "{}" 2>&1 | head -n 50'
+Every MCP server you register injects its tool schemas into the model's context on every turn — roughly 2–3k tokens per session of tool-schema tax, plus a background daemon to manage.
 
-# If installed to PATH
-scour "https://example.com" 2>&1 | head -n 200
-```
+`scour` ships `skills/scour/SKILL.md` so a coding agent can skip MCP registration entirely and run the binary through its normal bash tool instead:
 
-The CLI prints the title on the first line, clean markdown on stdout, and metadata (`page_type`, `quality`, `links`) on stderr.
+- **No schema tax** — saves roughly 2–3k context tokens per session.
+- **Unix output** — markdown on stdout pipes into `head`, `grep`, or files.
+- **No daemon** — executes on demand, prints, exits.
 
----
+Install it by copying `skills/scour/SKILL.md` into the agent's skills directory (see `skills/scour/SKILL.md` for the exact path). MCP stays available for callers that prefer structured JSON.
 
-## Escalation Ladder
+## Features
 
-| Tier | Latency | Scope |
-|---|---|---|
-| 1. `reqwest` (Chrome 131 UA, cookies, gzip/br) | ~300ms | Handles the majority of standard web pages |
-| 2. Brave headless via DevTools (reuse singleton) | ~3.5s | Cloudflare, JS app shells, anti-bot interstitials |
+- **Single-page scraping** — clean markdown plus title, description, headings, links, and images.
+- **Batch scraping** — up to 10 URLs in parallel via `scrape_batch`.
+- **Site crawling** — same-domain, best-first focus-aware BFS returning markdown per page plus the link graph.
+- **Keyless web search** — DuckDuckGo HTML + Bing in parallel, deduped and ranked; supports `site:`, freshness, and `exclude_sites` filters.
+- **Readability-first extraction** — articles via readability, list/index pages (HN, Reddit, search results) via a trafilatura-style fallback.
+- **BM25 focus** — a query keeps only the relevant paragraphs of a long document.
+- **Two-tier fetching** — ~300 ms plain HTTP first, ~3.5 s headless browser only when blocked.
+- **1-hour cache** — in-memory LRU plus a persistent file cache.
+- **Screenshots** — full-page base64 PNG via headless Brave.
+- **Pagination** — `offset` / `next_offset` for walking long pages.
 
-Escalation occurs only on explicit block signals: `401`/`403`/`429`/`503`, `<500B` body, challenge signatures (`cdn-cgi`, `captcha-delivery`), or low visible text with a high script ratio.
+## Quick start
 
----
-
-## Building & CLI Use
+Requirements: Rust 1.85+ (edition 2024). A browser (Brave or Chromium) is optional — only the fallback tier needs one.
 
 ```sh
 cargo build --release
+./target/release/scour "https://example.com"
+```
 
-# CLI smoke test (portable, no hardcoded absolute path)
-cargo run --release -- https://example.com
+```sh
+cargo test
+```
 
-# CLI with BM25 focus query
-cargo run --release -- https://example.com "query"
+```sh
+cargo install --path .
+```
 
-# Direct binary after build
-./target/release/scour https://example.com
+After `cargo install --path .`, the binary is on `PATH` as `scour`.
+The release build output lands at `./target/release/scour`.
 
-# Via $SCOUR_DIR checkout
-SCOUR_DIR=$(pwd) $SCOUR_DIR/target/release/scour https://example.com
+## CLI usage
 
-# Run as stdio MCP server
-cargo run --release --
-# or
+The CLI takes a URL and an optional focus query — no flags:
+
+```sh
+./target/release/scour "https://example.com"
+```
+
+```sh
+./target/release/scour "https://example.com" "second argument is a BM25 focus query"
+```
+
+```sh
+./target/release/scour "https://news.ycombinator.com" 2>&1 | head -n 100
+```
+
+```sh
+./target/release/scour "https://example.com" 2>&1 | grep -i "example"
+```
+
+Stdout contract: line 1 is the page title, the rest is clean markdown. Stderr carries the metadata: `page_type`, `quality`, links count, and `next_offset`. With no arguments the binary runs as a stdio MCP server instead of scraping:
+
+```sh
 ./target/release/scour
 ```
 
----
+Once installed to `PATH`, the same invocations work through the installed name:
 
-## MCP Tools (stdio)
+```sh
+scour "https://example.com"
+```
 
-If you prefer structured MCP integration, add `scour` to your MCP configuration (use a portable path):
+```sh
+scour "https://example.com" "focus query"
+```
+
+Long pages are walked with `offset` (MCP `scrape` param): when stderr reports a `next_offset`, pass it back as `offset` to fetch the next chunk. When a page is long and you only need one section, prefer a focus query over paging through the whole document — the BM25 filter (below) keeps the relevant paragraphs and drops the rest.
+
+## MCP configuration
+
+Add `scour` to your MCP config with the binary path (use `cargo install --path .` and plain `scour` if it is on `PATH`):
 
 ```json
 {
@@ -124,31 +135,44 @@ If you prefer structured MCP integration, add `scour` to your MCP configuration 
 }
 ```
 
-Or with `cargo run` (dev) or `~/.cargo/bin/scour` after `cargo install --path .`:
+| Tool | What it does | Key params |
+|---|---|---|
+| `scrape` | Scrapes a single page to markdown + metadata | `url`, `focus?`, `max_chars?`, `include_links?`, `offset?`, `options?` |
+| `scrape_batch` | Scrapes up to 10 URLs in parallel | `urls` (1–10), `focus?`, `max_chars?` |
+| `crawl` | Same-domain best-first BFS crawl with markdown per page + link graph | `url`, `max_pages?=5`, `max_depth?=2`, `focus?`, `max_chars?=8000`, `sitemap?`, `discover_only?`, `max_total_chars?` |
+| `search` | Keyless web search, deduped and ranked | `query`, `max_results?=10`, plus `site:`, freshness, `exclude_sites` filters |
+| `screenshot` | Full-page base64 PNG via headless Brave | `url` |
+| `cache_clear` | Flushes the cache | — |
+| `scour_version` | Returns binary version and feature set | — |
 
-```json
-{
-  "mcpServers": {
-    "scour": {
-      "command": "scour"
-    }
-  }
-}
-```
+The `scrape` `options` bag adds `include_media`, page `actions` (`click` / `fill` with `selector` + `text`), and multi-page support.
 
-Set `SCOUR_DIR` to your checkout location, or use `cargo install --path .` and put `scour` on `PATH`.
+The server speaks MCP over stdio (via `rmcp` 3.1 server + stdio transport), so any MCP client that can spawn a subprocess can use it — no ports, no daemon, no auth to configure. CLI callers that need the same data as plain text use `scour <url> [focus]` and parse stdout instead.
 
-### Available Tools
+## Escalation ladder
 
-- `scrape(url, focus?, max_chars?, include_links?, offset?, options?)` — Scrapes a single page.
-- `scrape_batch(urls[1..10], focus?, max_chars?)` — Scrapes up to 10 URLs in parallel.
-- `crawl(url, max_pages?=5, max_depth?=2, focus?, max_chars?=8000)` — In-domain BFS crawl.
-- `search(query, max_results?=10)` — Keyless search across DDG and Bing.
-- `screenshot(url)` — Captures a full-page screenshot via Brave headless.
-- `cache_clear()` — Flushes the 1-hour cache.
-- `scour_version()` — Returns binary version and active feature set.
+Cheapest tier first; the browser only fires on explicit block signals.
 
-### Output Schema (`ScrapeResult`)
+| Tier | Transport | Typical latency | When it fires |
+|---|---|---|---|
+| 1 | Plain HTTP via reqwest (Chrome 131 UA, cookies, gzip/brotli) | ~300 ms | Default — handles the large majority of pages |
+| 2 | Brave/Chromium headless over DevTools (singleton browser reused across fetches) | ~3.5 s | HTTP 401/403/429/503, body < 500 B, challenge signatures (`cdn-cgi`, `captcha-delivery`), or low visible text with a high script ratio |
+
+The browser is auto-detected at `/usr/bin/brave`, `/usr/bin/chromium`, and similar paths; override with `SCOUR_BROWSER=/path/to/brave`.
+
+## Extraction and BM25 focus
+
+Extraction is readability-first: article pages go through readability, while list/index pages (Hacker News, Reddit, search results) fall through to a trafilatura-style fallback so they return usable markdown instead of nothing. `html2md` renders the markdown, `ammonia` sanitizes the HTML, and the extractor reports `page_type` (`article` | `list` | `media`), a `quality_score`, links as `href` + `text` pairs (no table garbage), a headings list, extracted media/images, and `offset` / `next_offset` pagination.
+
+BM25 focus narrows a long document to what you asked about. Pass a query as the second CLI argument (or `focus` to the MCP tools) and `scour` applies query-driven term weighting with a heading boost, keeping only the relevant paragraphs — useful for pulling one section out of long docs.
+
+## Caching
+
+Fetches are cached for 1 hour in two layers: an in-memory LRU capped at 200 entries, backed by a persistent file cache at `~/.cache/scour/cache.json` guarded with `fs2` file locking so concurrent processes share it safely. `cache_clear()` flushes it.
+
+## Output schema
+
+`scrape` returns a `ScrapeResult` object:
 
 ```json
 {
@@ -170,3 +194,37 @@ Set `SCOUR_DIR` to your checkout location, or use `cargo install --path .` and p
   "truncated": false
 }
 ```
+
+Field notes: `tier` records which fetch tier served the page; `blocked` / `content_ok` / `note` / `next_action` describe anti-bot outcomes; `total_chars` and `truncated` describe length limiting by `max_chars`.
+
+## Configuration reference
+
+| Setting | What it is |
+|---|---|
+| `SCOUR_BROWSER` | Path to the browser binary for the Tier 2 fallback (auto-detected when unset) |
+| `SCOUR_DIR` | Checkout path convention used in the skill docs for invoking the built binary |
+| `~/.cache/scour/cache.json` | Persistent file cache location (1-hour TTL, `fs2`-locked) |
+
+## Development and CI
+
+Stack: Rust edition 2024 with `ammonia`, `anyhow`, `base64`, `fs2`, `futures`, `headless_chrome`, `html2md`, `lru`, `readability`, `reqwest` 0.13 (rustls, charset, http2, gzip, brotli, cookies), `rmcp` 3.1 (server + stdio transport), `schemars`, `scraper` 0.24, `serde`/`serde_json`, `tokio`, `url`. 19 unit tests total (`main` 10, `fetcher` 4, `extractor` 3, `cache` 2).
+
+```sh
+cargo test
+```
+
+```sh
+cargo clippy -- -D warnings
+```
+
+```sh
+cargo build --release
+```
+
+CI (`.github/workflows/ci.yml`, workflow name `CI`) runs on `ubuntu-latest` with stable Rust + clippy and executes `cargo test`, `cargo clippy -- -D warnings`, and `cargo build --release`.
+
+Repo topics: `rust`, `web-scraping`, `mcp`, `scraper`, `cli`, `html-to-markdown`, `search`, `bm25`, `local-first`, `headless-browser`, `crawling`, `agents`, `llm-tools`, `readability`.
+
+## License
+
+MIT — see [LICENSE](LICENSE).
