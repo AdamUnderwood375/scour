@@ -9,6 +9,8 @@
 mod cache;
 mod extractor;
 mod fetcher;
+mod search;
+mod tools;
 
 use cache::{cache_get, cache_key, cache_key_ext, cache_set};
 use rmcp::{
