@@ -36,12 +36,72 @@ fn is_public_v4(ip: Ipv4Addr) -> bool {
 }
 
 fn is_public_v6(ip: Ipv6Addr) -> bool {
-    let first = ip.segments()[0];
+    let seg = ip.segments();
+    let first = seg[0];
+    // 6to4 2002::/16 embeds a v4 in bits 16..48 (segments 1-2); judge by it so
+    // 2002:c0a8:0101:: can't smuggle 192.168.1.1 past us.
+    if first == 0x2002 {
+        let v4 = Ipv4Addr::new(
+            (seg[1] >> 8) as u8,
+            (seg[1] & 0xff) as u8,
+            (seg[2] >> 8) as u8,
+            (seg[2] & 0xff) as u8,
+        );
+        return is_public_v4(v4);
+    }
+    // NAT64 well-known prefix 64:ff9b::/96 and the local 64:ff9b:1::/48 embed a
+    // v4 in the last 32 bits (segments 6-7).
+    if seg[0] == 0x0064
+        && seg[1] == 0xff9b
+        && ((seg[2] == 0 && seg[3] == 0 && seg[4] == 0 && seg[5] == 0) || seg[2] == 0x0001)
+    {
+        let v4 = Ipv4Addr::new(
+            (seg[6] >> 8) as u8,
+            (seg[6] & 0xff) as u8,
+            (seg[7] >> 8) as u8,
+            (seg[7] & 0xff) as u8,
+        );
+        return is_public_v4(v4);
+    }
     !(ip.is_loopback()
         || ip.is_unspecified()
         || ip.is_multicast()
         || (first & 0xfe00) == 0xfc00 // ULA fc00::/7
         || (first & 0xffc0) == 0xfe80) // link-local fe80::/10
+}
+
+/// SSRF guard for the Chrome path. Chrome resolves DNS itself, bypassing the
+/// `PublicOnlyDns` resolver, so every browser navigation (and its final URL
+/// after redirects) must pass through here first. Rejects non-http(s) schemes,
+/// literal non-public IPs, and hostnames that resolve to any non-public address
+/// (or resolve to nothing).
+pub async fn check_public_url(url: &str) -> Result<()> {
+    let u = url::Url::parse(url).map_err(|e| anyhow!("bad url: {e}"))?;
+    if !matches!(u.scheme(), "http" | "https") {
+        return Err(anyhow!("blocked: non-public address"));
+    }
+    match u.host() {
+        Some(url::Host::Ipv4(v4)) if is_public_ip(IpAddr::V4(v4)) => Ok(()),
+        Some(url::Host::Ipv6(v6)) if is_public_ip(IpAddr::V6(v6)) => Ok(()),
+        Some(url::Host::Domain(host)) => {
+            let port = u.port_or_known_default().unwrap_or(0);
+            let addrs = tokio::net::lookup_host((host, port))
+                .await
+                .map_err(|_| anyhow!("blocked: non-public address"))?;
+            let mut any = false;
+            let mut all_public = true;
+            for sa in addrs {
+                any = true;
+                all_public &= is_public_ip(sa.ip());
+            }
+            if any && all_public {
+                Ok(())
+            } else {
+                Err(anyhow!("blocked: non-public address"))
+            }
+        }
+        _ => Err(anyhow!("blocked: non-public address")),
+    }
 }
 
 /// Reject a redirect hop whose host is a literal non-public IP, or whose scheme
@@ -208,8 +268,13 @@ pub fn block_reason(status: u16, html: &str) -> Option<String> {
     if matches!(status, 401 | 403 | 407 | 429 | 503) {
         return Some(format!("HTTP {status} from origin"));
     }
+    // A tiny body is only suspicious when it also has almost no visible text.
+    // Plain small JSON/text responses have real content and must not escalate.
     if html.len() < 500 {
-        return Some("near-empty response body".into());
+        let (visible, _) = visible_and_script_len(html);
+        if visible < 64 {
+            return Some("near-empty response body".into());
+        }
     }
 
     // Interstitials are small. A 200KB document is real content even if it
@@ -342,7 +407,7 @@ fn fetch_chrome_blocking(
     url: &str,
     first_status: u16,
     first_reason: Option<String>,
-) -> Result<Fetched> {
+) -> Result<(Fetched, String)> {
     let tab = {
         let b = browser().map_err(|e| anyhow!("{e}"))?;
         let guard = b.lock().map_err(|_| anyhow!("browser mutex poisoned"))?;
@@ -363,17 +428,23 @@ fn fetch_chrome_blocking(
         html = tab.get_content().unwrap_or_default();
         reason = block_reason(200, &html);
     }
+    // Final URL after any redirects Chrome followed on its own — re-checked by
+    // the caller so a redirect hop to an internal host can't leak content.
+    let final_url = tab.get_url();
     let _ = tab.close(true);
-    Ok(Fetched {
-        blocked: reason.is_some(),
-        reason,
-        first_reason,
-        html,
-        tier: Tier::Chrome,
-        status: 200,
-        escalated: true,
-        first_status,
-    })
+    Ok((
+        Fetched {
+            blocked: reason.is_some(),
+            reason,
+            first_reason,
+            html,
+            tier: Tier::Chrome,
+            status: 200,
+            escalated: true,
+            first_status,
+        },
+        final_url,
+    ))
 }
 
 /// Fetch `url`, escalating to a real browser only when the cheap path is blocked.
@@ -386,19 +457,27 @@ pub async fn fetch(url: &str) -> Result<Fetched> {
         Err(e) if is_block_error(e) => return cheap,
         _ => {}
     }
+    // Chrome resolves DNS itself, bypassing PublicOnlyDns — guard before it
+    // ever navigates.
+    check_public_url(url).await?;
     let first_status = cheap.as_ref().map(|f| f.status).unwrap_or(0);
     let first_reason = cheap.as_ref().ok().and_then(|f| f.reason.clone());
     let u = url.to_string();
     // headless_chrome is sync; keep it off the async runtime's worker threads.
-    match tokio::task::spawn_blocking(move || fetch_chrome_blocking(&u, first_status, first_reason))
-        .await?
-    {
-        Ok(f) => Ok(f),
-        // Browser missing/unlaunchable: better to hand back the blocked cheap
-        // response (agent sees the challenge page, `blocked: true`) than to
-        // fail the call outright.
-        Err(e) => cheap.map_err(|_| e),
-    }
+    let (fetched, final_url) =
+        match tokio::task::spawn_blocking(move || fetch_chrome_blocking(&u, first_status, first_reason))
+            .await?
+        {
+            Ok(pair) => pair,
+            // Browser missing/unlaunchable: better to hand back the blocked cheap
+            // response (agent sees the challenge page, `blocked: true`) than to
+            // fail the call outright.
+            Err(e) => return cheap.map_err(|_| e),
+        };
+    // Chrome may have followed redirects on its own; re-check where it landed
+    // and discard the content if it ended on a non-public host.
+    check_public_url(&final_url).await?;
+    Ok(fetched)
 }
 
 #[cfg(test)]
@@ -483,6 +562,15 @@ mod tests {
         for ok in ["2606:4700:4700::1111", "2001:4860:4860::8888"] {
             assert!(is_public_ip(ip(ok)), "{ok} should be public");
         }
+    }
+
+    #[test]
+    fn is_public_ip_v6_embedded_v4() {
+        // NAT64 64:ff9b::/96 and 6to4 2002::/16 embed a v4 that must be judged
+        // by the v4 ranges, or metadata/LAN hosts slip through.
+        assert!(!is_public_ip(ip("64:ff9b::a9fe:a9fe")), "NAT64 of 169.254.169.254");
+        assert!(!is_public_ip(ip("2002:c0a8:0101::")), "6to4 of 192.168.1.1");
+        assert!(is_public_ip(ip("2002:0808:0808::")), "6to4 of 8.8.8.8");
     }
 
     #[test]

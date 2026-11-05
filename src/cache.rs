@@ -36,8 +36,20 @@ pub fn cache_key_ext(
     offset: Option<usize>,
     include_media: bool,
     pages: Option<&str>,
-    actions_len: usize,
+    actions: Option<&[crate::Action]>,
 ) -> String {
+    // Key on the *content* of the action sequence, not just its length, so two
+    // different sequences of equal length can't collide. No actions keeps the
+    // literal "0" so existing no-action keys are unchanged.
+    let actions_hash = match actions {
+        Some(a) if !a.is_empty() => {
+            use std::hash::{Hash, Hasher};
+            let mut h = std::collections::hash_map::DefaultHasher::new();
+            format!("{a:?}").hash(&mut h);
+            h.finish()
+        }
+        _ => 0,
+    };
     format!(
         "{}|{}|{}|{}|{}|{}|{}",
         url,
@@ -46,7 +58,7 @@ pub fn cache_key_ext(
         offset.unwrap_or(0),
         include_media,
         pages.unwrap_or(""),
-        actions_len
+        actions_hash
     )
 }
 

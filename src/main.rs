@@ -766,7 +766,7 @@ async fn run_ext_stats(
     if let Some(pdf) = try_pdf_fetch(url, pages, max_chars, offset).await? {
         // Check if we should still use offset/next_offset and include_media (media empty for pdf)
         // Cache pdf result too
-        let key = cache_key_ext(url, focus, max_chars, offset, include_media, pages, actions.map(|a| a.len()).unwrap_or(0));
+        let key = cache_key_ext(url, focus, max_chars, offset, include_media, pages, actions);
         // don't cache failed pdf previews? cache anyway
         cache_set(key, pdf.clone());
         let ms = t0.elapsed().as_millis();
@@ -776,7 +776,7 @@ async fn run_ext_stats(
 
     let actions_len = actions.map(|a| a.len()).unwrap_or(0);
     // Use extended cache key so pagination/actions don't collide
-    let key = cache_key_ext(url, focus, max_chars, offset, include_media, pages, actions_len);
+    let key = cache_key_ext(url, focus, max_chars, offset, include_media, pages, actions);
     // but also check legacy key for backwards compat when offset etc are default
     if let Some(cached) = cache_get(&key) {
         let ms = t0.elapsed().as_millis();
