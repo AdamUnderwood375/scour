@@ -3,8 +3,91 @@
 //! the cheap tier is visibly blocked (Cloudflare / JS-rendered shell).
 
 use anyhow::{Result, anyhow};
-use std::sync::{Mutex, OnceLock};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
+
+/// SSRF guard: is `ip` a globally-routable address an agent is allowed to reach?
+/// False for every form that could point at the host, the LAN, or cloud
+/// metadata. Covers IPv4-mapped / -compatible IPv6 encodings of the v4 ranges.
+pub fn is_public_ip(ip: IpAddr) -> bool {
+    match ip {
+        IpAddr::V4(v4) => is_public_v4(v4),
+        // ::ffff:a.b.c.d (mapped) and ::a.b.c.d (compat) both decode here, so a
+        // v6 literal can't smuggle a private v4 past the v4 checks.
+        IpAddr::V6(v6) => match v6.to_ipv4() {
+            Some(v4) => is_public_v4(v4),
+            None => is_public_v6(v6),
+        },
+    }
+}
+
+fn is_public_v4(ip: Ipv4Addr) -> bool {
+    let o = ip.octets();
+    !(ip.is_loopback()
+        || ip.is_private() // 10/8, 172.16/12, 192.168/16
+        || ip.is_link_local() // 169.254/16
+        || ip.is_unspecified() // 0.0.0.0
+        || ip.is_broadcast() // 255.255.255.255
+        || ip.is_multicast() // 224/4
+        || ip.is_documentation() // 192.0.2/24, 198.51.100/24, 203.0.113/24
+        || o[0] == 0 // 0/8
+        || (o[0] == 100 && (o[1] & 0b1100_0000) == 0b0100_0000)) // 100.64/10 CGNAT
+}
+
+fn is_public_v6(ip: Ipv6Addr) -> bool {
+    let first = ip.segments()[0];
+    !(ip.is_loopback()
+        || ip.is_unspecified()
+        || ip.is_multicast()
+        || (first & 0xfe00) == 0xfc00 // ULA fc00::/7
+        || (first & 0xffc0) == 0xfe80) // link-local fe80::/10
+}
+
+/// Reject a redirect hop whose host is a literal non-public IP, or whose scheme
+/// isn't http/https. Hostnames that *resolve* to private IPs are caught by the
+/// DNS resolver, not here.
+fn redirect_host_ok(url: &url::Url) -> bool {
+    if !matches!(url.scheme(), "http" | "https") {
+        return false;
+    }
+    match url.host() {
+        Some(url::Host::Ipv4(v4)) => is_public_ip(IpAddr::V4(v4)),
+        Some(url::Host::Ipv6(v6)) => is_public_ip(IpAddr::V6(v6)),
+        _ => true,
+    }
+}
+
+/// True when a fetch error came from our SSRF guards, so `fetch()` knows not to
+/// retry it through Chrome (which would happily load the internal URL).
+fn is_block_error(e: &anyhow::Error) -> bool {
+    e.chain()
+        .any(|c| c.to_string().contains("blocked: non-public address"))
+}
+
+/// reqwest DNS resolver that drops every non-public address before a socket is
+/// opened. Because every connection — including redirect hops — resolves
+/// through this, hostnames pointing at localhost / the LAN / cloud metadata
+/// never connect.
+#[derive(Debug)]
+struct PublicOnlyDns;
+
+impl reqwest::dns::Resolve for PublicOnlyDns {
+    fn resolve(&self, name: reqwest::dns::Name) -> reqwest::dns::Resolving {
+        let host = name.as_str().to_string();
+        Box::pin(async move {
+            let addrs = tokio::net::lookup_host((host.as_str(), 0)).await?;
+            let kept: Vec<SocketAddr> = addrs.filter(|sa| is_public_ip(sa.ip())).collect();
+            if kept.is_empty() {
+                return Err(Box::<dyn std::error::Error + Send + Sync>::from(
+                    "blocked: non-public address",
+                ));
+            }
+            let iter: reqwest::dns::Addrs = Box::new(kept.into_iter());
+            Ok(iter)
+        })
+    }
+}
 
 /// Which rung of the ladder produced the HTML. Returned to the agent so it can
 /// reason about cost/trust without guessing.
@@ -50,6 +133,19 @@ pub fn client() -> &'static reqwest::Client {
             )
             .cookie_store(true)
             .timeout(Duration::from_secs(20))
+            // SSRF guard: only ever connect to public addresses, and bound
+            // redirects so a page can't bounce us onto an internal host.
+            .dns_resolver(Arc::new(PublicOnlyDns))
+            .redirect(reqwest::redirect::Policy::custom(|attempt| {
+                if attempt.previous().len() >= 10 {
+                    return attempt.error("too many redirects");
+                }
+                if redirect_host_ok(attempt.url()) {
+                    attempt.follow()
+                } else {
+                    attempt.error("blocked: non-public address")
+                }
+            }))
             .build()
             .expect("http client")
     })
@@ -269,6 +365,9 @@ pub async fn fetch(url: &str) -> Result<Fetched> {
     let cheap = fetch_http(url).await;
     match &cheap {
         Ok(f) if !f.blocked => return cheap,
+        // SSRF block: hand the error straight back. Escalating would just load
+        // the internal URL in a browser that has no DNS guard.
+        Err(e) if is_block_error(e) => return cheap,
         _ => {}
     }
     let first_status = cheap.as_ref().map(|f| f.status).unwrap_or(0);
@@ -340,6 +439,58 @@ mod tests {
             "analysis text ".repeat(6000)
         );
         assert!(block_reason(200, &quoting).is_none());
+    }
+
+    fn ip(s: &str) -> IpAddr {
+        s.parse().unwrap()
+    }
+
+    #[test]
+    fn is_public_ip_v4() {
+        for bad in [
+            "127.0.0.1", "10.0.0.1", "172.16.5.4", "192.168.1.1", "169.254.169.254",
+            "100.64.0.1", "0.0.0.0", "0.1.2.3", "255.255.255.255", "224.0.0.1",
+            "192.0.2.5", "198.51.100.5", "203.0.113.5",
+        ] {
+            assert!(!is_public_ip(ip(bad)), "{bad} should be non-public");
+        }
+        for ok in ["8.8.8.8", "1.1.1.1", "100.63.255.255", "100.128.0.1", "93.184.216.34"] {
+            assert!(is_public_ip(ip(ok)), "{ok} should be public");
+        }
+    }
+
+    #[test]
+    fn is_public_ip_v6() {
+        for bad in ["::1", "::", "fc00::1", "fd12:3456::1", "fe80::1", "ff02::1"] {
+            assert!(!is_public_ip(ip(bad)), "{bad} should be non-public");
+        }
+        for ok in ["2606:4700:4700::1111", "2001:4860:4860::8888"] {
+            assert!(is_public_ip(ip(ok)), "{ok} should be public");
+        }
+    }
+
+    #[test]
+    fn is_public_ip_v4_mapped_and_compat() {
+        // Both encodings of a v4 address must be judged by the v4 ranges.
+        assert!(!is_public_ip(ip("::ffff:169.254.169.254")));
+        assert!(!is_public_ip(ip("::ffff:127.0.0.1")));
+        assert!(!is_public_ip(ip("::ffff:10.0.0.1")));
+        assert!(!is_public_ip(ip("::127.0.0.1")));
+        assert!(is_public_ip(ip("::ffff:8.8.8.8")));
+    }
+
+    #[test]
+    fn redirect_host_check() {
+        let allow = |u: &str| redirect_host_ok(&url::Url::parse(u).unwrap());
+        assert!(allow("https://example.com/x"));
+        assert!(allow("http://8.8.8.8/"));
+        assert!(!allow("http://169.254.169.254/latest/meta-data/"));
+        assert!(!allow("http://127.0.0.1/"));
+        assert!(!allow("http://[::1]/"));
+        assert!(!allow("http://[::ffff:10.0.0.1]/"));
+        assert!(!allow("file:///etc/passwd"));
+        // Hostnames pass here; the DNS resolver is what guards their addresses.
+        assert!(allow("http://localtest.me/"));
     }
 
     #[test]
