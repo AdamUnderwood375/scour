@@ -2443,6 +2443,7 @@ dependencies = [
  "ammonia",
  "anyhow",
  "base64 0.22.1",
+ "encoding_rs",
  "fs2",
  "futures",
  "headless_chrome",

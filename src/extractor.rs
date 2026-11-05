@@ -146,34 +146,86 @@ pub fn clean_markdown(md: &str) -> String {
     let mut out = String::with_capacity(md.len());
     let mut blanks = 0usize; // pending blank lines, not yet written
     let mut prev_text = false; // previous input line had alphanumerics
+    let mut prev_indent_code = false; // previous line was indented code
+    let mut fence: Option<u8> = None; // inside ``` / ~~~ block (which marker)
     for line in md.lines() {
+        // Fenced code: emit verbatim so alignment and rule-like lines survive.
+        if let Some(ch) = fence {
+            flush_blanks(&mut out, &mut blanks);
+            out.push_str(line);
+            out.push('\n');
+            if fence_marker(line) == Some(ch) {
+                fence = None;
+            }
+            prev_text = false;
+            prev_indent_code = false;
+            continue;
+        }
+        let lead = line.len() - line.trim_start().len();
+        // Opening fence (indent < 4, else it is indented code).
+        if lead < 4 && let Some(ch) = fence_marker(line) {
+            flush_blanks(&mut out, &mut blanks);
+            out.push_str(line);
+            out.push('\n');
+            fence = Some(ch);
+            prev_text = false;
+            prev_indent_code = false;
+            continue;
+        }
         let t = line.trim();
         if t.is_empty() {
             blanks += 1;
             prev_text = false;
+            prev_indent_code = false;
+            continue;
+        }
+        // Indented code block: >=4 spaces/tab after a blank line or more code.
+        if lead >= 4 && (blanks > 0 || prev_indent_code) {
+            flush_blanks(&mut out, &mut blanks);
+            out.push_str(line);
+            out.push('\n');
+            prev_text = false;
+            prev_indent_code = true;
             continue;
         }
         let has_text = t.chars().any(char::is_alphanumeric);
         let rule_like = t.chars().all(|c| c.is_whitespace() || matches!(c, '|' | '-' | ':'));
         let separator_after_text = prev_text && t.contains('|') && t.contains('-');
         prev_text = has_text;
+        prev_indent_code = false;
         if rule_like && !separator_after_text {
             continue;
         }
-        if !out.is_empty() {
-            let n = if blanks >= 3 { 1 } else { blanks };
-            out.push_str(&"\n".repeat(n));
-        }
-        blanks = 0;
-        let indent = line.len() - line.trim_start().len();
-        out.push_str(&line[..indent]);
-        collapse_space_runs(&line[indent..], &mut out);
+        flush_blanks(&mut out, &mut blanks);
+        out.push_str(&line[..lead]);
+        collapse_space_runs(&line[lead..], &mut out);
         out.push('\n');
     }
     if out.ends_with('\n') {
         out.pop();
     }
     out
+}
+
+/// Write pending blank lines (3+ collapsed to one), then reset the counter.
+fn flush_blanks(out: &mut String, blanks: &mut usize) {
+    if !out.is_empty() {
+        let n = if *blanks >= 3 { 1 } else { *blanks };
+        out.push_str(&"\n".repeat(n));
+    }
+    *blanks = 0;
+}
+
+/// Fence marker a line opens/closes with (ignoring up-to-3-space indent).
+fn fence_marker(line: &str) -> Option<u8> {
+    let t = line.trim_start();
+    if t.starts_with("```") {
+        Some(b'`')
+    } else if t.starts_with("~~~") {
+        Some(b'~')
+    } else {
+        None
+    }
 }
 
 /// Append `s` to `out`, replacing each run of 3+ spaces/tabs with one space.
@@ -424,6 +476,24 @@ mod tests {
         assert_eq!(super::clean_markdown("|---|---|\nafter"), "after");
         let table = "| a | b |\n|---|:--:|\n| 1 | 2 |";
         assert_eq!(super::clean_markdown(table), table);
+    }
+
+    #[test]
+    fn clean_markdown_preserves_fenced_code() {
+        let md = "intro\n\n```rust\nfn main() {\n    let x   = 1;\n    ------\n}\n```\n\nafter   text";
+        let out = super::clean_markdown(md);
+        assert!(out.contains("    let x   = 1;"), "aligned code collapsed: {out:?}");
+        assert!(out.contains("    ------"), "rule inside fence dropped: {out:?}");
+        assert!(out.contains("after text"), "prose runs not collapsed: {out:?}");
+    }
+
+    #[test]
+    fn clean_markdown_preserves_indented_code() {
+        let md = "prose here\n\n    code    aligned\n    ------\n\nmore   prose";
+        let out = super::clean_markdown(md);
+        assert!(out.contains("    code    aligned"), "indented code collapsed: {out:?}");
+        assert!(out.contains("    ------"), "rule in indented code dropped: {out:?}");
+        assert!(out.contains("more prose"));
     }
 
     #[test]

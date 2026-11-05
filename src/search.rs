@@ -116,16 +116,16 @@ pub(crate) fn parse_ddg(html: &str) -> Vec<SearchHit> {
 }
 
 fn resolve_ddg_href(href: &str) -> String {
-    let mut href = href.trim().to_string();
-    if href.starts_with("//") {
-        href = format!("https:{href}");
-    }
-    if let Ok(u) = url::Url::parse(&href)
+    let href = href.trim();
+    // Join against the DDG base so root-relative (`/l/?uddg=...`),
+    // protocol-relative (`//x`), and absolute hrefs all parse.
+    let base = url::Url::parse("https://duckduckgo.com/").expect("static base");
+    if let Ok(u) = base.join(href)
         && let Some((_, v)) = u.query_pairs().find(|(k, _)| k == "uddg")
     {
         return v.into_owned();
     }
-    href
+    href.to_string()
 }
 
 pub(crate) fn parse_bing(html: &str) -> Vec<SearchHit> {
@@ -489,6 +489,11 @@ mod tests {
         assert_eq!(
             resolve_ddg_href("//duckduckgo.com/l/?uddg=https%3A%2F%2Fex.com%2Fcaf%C3%A9&rut=x"),
             "https://ex.com/café"
+        );
+        // root-relative href (no scheme/host) must still resolve.
+        assert_eq!(
+            resolve_ddg_href("/l/?uddg=https%3A%2F%2Fex.com%2Fpage&rut=x"),
+            "https://ex.com/page"
         );
     }
 

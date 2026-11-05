@@ -75,6 +75,9 @@ fn is_public_v6(ip: Ipv6Addr) -> bool {
 /// after redirects) must pass through here first. Rejects non-http(s) schemes,
 /// literal non-public IPs, and hostnames that resolve to any non-public address
 /// (or resolve to nothing).
+///
+/// Residual TOCTOU: Chrome resolves DNS itself after this check, so a rebinding
+/// attacker could return a public IP here and a private one to the browser.
 pub async fn check_public_url(url: &str) -> Result<()> {
     let u = url::Url::parse(url).map_err(|e| anyhow!("bad url: {e}"))?;
     if !matches!(u.scheme(), "http" | "https") {
@@ -87,7 +90,7 @@ pub async fn check_public_url(url: &str) -> Result<()> {
             let port = u.port_or_known_default().unwrap_or(0);
             let addrs = tokio::net::lookup_host((host, port))
                 .await
-                .map_err(|_| anyhow!("blocked: non-public address"))?;
+                .map_err(|e| anyhow!("dns lookup failed for {host}: {e}"))?;
             let mut any = false;
             let mut all_public = true;
             for sa in addrs {
@@ -324,10 +327,52 @@ pub fn block_reason(status: u16, html: &str) -> Option<String> {
     None
 }
 
+/// Decode a streamed body using the content-type charset — mirroring reqwest's
+/// `charset`-feature `text()` path, which we no longer call — falling back to
+/// UTF-8 (lossy) for absent or unknown labels.
+fn decode_body(bytes: &[u8], content_type: Option<&str>) -> String {
+    let label = content_type.and_then(|ct| {
+        ct.split(';').find_map(|p| {
+            p.trim()
+                .strip_prefix("charset=")
+                .map(|c| c.trim().trim_matches('"'))
+        })
+    });
+    let enc = label
+        .and_then(|l| encoding_rs::Encoding::for_label(l.as_bytes()))
+        .unwrap_or(encoding_rs::UTF_8);
+    enc.decode(bytes).0.into_owned()
+}
+
+/// Cap the decoded body so an extension-less PDF/binary can't exhaust memory:
+/// error for non-HTML, truncate for HTML (we still want partial markup).
+const MAX_BODY: usize = 20 * 1024 * 1024;
+
 async fn fetch_http(url: &str) -> Result<Fetched> {
-    let res = client().get(url).send().await?;
+    let mut res = client().get(url).send().await?;
     let status = res.status().as_u16();
-    let html = res.text().await?;
+    let ctype = res
+        .headers()
+        .get(reqwest::header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .map(str::to_ascii_lowercase);
+    let is_html = match &ctype {
+        Some(ct) => ct.contains("text/html") || ct.contains("application/xhtml"),
+        None => true, // unknown / extension-less: treat as HTML, detect downstream
+    };
+    let mut buf: Vec<u8> = Vec::new();
+    while let Some(chunk) = res.chunk().await? {
+        if buf.len() + chunk.len() > MAX_BODY {
+            if !is_html {
+                return Err(anyhow!("body exceeds 20MB"));
+            }
+            let take = MAX_BODY - buf.len();
+            buf.extend_from_slice(&chunk[..take]);
+            break; // truncate HTML and work with what we have
+        }
+        buf.extend_from_slice(&chunk);
+    }
+    let html = decode_body(&buf, ctype.as_deref());
     let reason = block_reason(status, &html);
     Ok(Fetched {
         blocked: reason.is_some(),
