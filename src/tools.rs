@@ -22,17 +22,8 @@ const CRATES_UA: &str = concat!(
 pub async fn gh(spec: &str) -> Result<String> {
     let (owner, repo) = parse_gh_spec(spec)?;
     let base = format!("https://api.github.com/repos/{owner}/{repo}");
-    let auth = std::env::var("GITHUB_TOKEN")
-        .ok()
-        .filter(|t| !t.is_empty())
-        .map(|t| format!("Bearer {t}"));
-    let mut headers = vec![
-        ("User-Agent", GH_UA),
-        ("Accept", "application/vnd.github+json"),
-    ];
-    if let Some(a) = &auth {
-        headers.push(("Authorization", a.as_str()));
-    }
+    let auth = gh_auth();
+    let headers = gh_headers("application/vnd.github+json", auth.as_deref());
 
     // Only the repo call is fatal; release lookup failures just drop the line.
     let (repo_res, release) =
@@ -44,6 +35,34 @@ pub async fn gh(spec: &str) -> Result<String> {
     }
     let repo_json = json_of(&body, &base)?;
     Ok(format_gh(&repo_json, release.as_ref().map(|r| r.as_ref())))
+}
+
+/// Cleaned README text (`clean_readme`) for `spec`. Raw media type, so the body is markdown.
+pub async fn gh_readme(spec: &str) -> Result<String> {
+    let (owner, repo) = parse_gh_spec(spec)?;
+    let url = format!("https://api.github.com/repos/{owner}/{repo}/readme");
+    let auth = gh_auth();
+    let headers = gh_headers("application/vnd.github.raw", auth.as_deref());
+    let (st, body) = get(&url, &headers).await?;
+    if !st.is_success() {
+        return Err(http_err("GitHub", st));
+    }
+    Ok(clean_readme(&body))
+}
+
+fn gh_auth() -> Option<String> {
+    std::env::var("GITHUB_TOKEN")
+        .ok()
+        .filter(|t| !t.is_empty())
+        .map(|t| format!("Bearer {t}"))
+}
+
+fn gh_headers<'a>(accept: &'a str, auth: Option<&'a str>) -> Vec<(&'a str, &'a str)> {
+    let mut h = vec![("User-Agent", GH_UA), ("Accept", accept)];
+    if let Some(a) = auth {
+        h.push(("Authorization", a));
+    }
+    h
 }
 
 /// Latest release, else newest tag (name only). Outer `None` = lookup failed;
@@ -179,6 +198,108 @@ fn valid_gh_part(p: &str) -> bool {
         && !p.is_empty()
         && p.bytes()
             .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.'))
+}
+
+/// Drops badge/image-only lines and HTML comments, collapses blank runs, and trims the ends.
+/// Fenced code blocks are kept verbatim (comments and badge-looking lines inside them too).
+pub fn clean_readme(raw: &str) -> String {
+    let mut out: Vec<String> = Vec::new();
+    // Open fence: (marker char, run length).
+    let mut fence: Option<(char, usize)> = None;
+    let mut in_comment = false;
+    for line in raw.lines() {
+        let t = line.trim_start();
+        let marker = t.chars().next().filter(|c| matches!(c, '`' | '~'));
+        let run = marker.map_or(0, |m| t.chars().take_while(|c| *c == m).count());
+        if let Some((fc, fl)) = fence {
+            if marker == Some(fc) && run >= fl && t[run..].trim().is_empty() {
+                fence = None;
+            }
+            out.push(line.to_string());
+            continue;
+        }
+        if let Some(m) = marker.filter(|_| run >= 3 && !in_comment) {
+            fence = Some((m, run));
+            out.push(line.to_string());
+            continue;
+        }
+        let line = strip_comments(line, &mut in_comment);
+        if is_markup_line(&line) {
+            continue;
+        }
+        if line.trim().is_empty() && out.last().is_none_or(|l| l.trim().is_empty()) {
+            continue;
+        }
+        out.push(line);
+    }
+    while out.last().is_some_and(|l| l.trim().is_empty()) {
+        out.pop();
+    }
+    out.join("\n")
+}
+
+/// Removes `<!-- … -->` spans; a span may cross lines, so `in_comment` carries over.
+fn strip_comments(line: &str, in_comment: &mut bool) -> String {
+    let mut out = String::new();
+    let mut rest = line;
+    loop {
+        if *in_comment {
+            match rest.find("-->") {
+                Some(i) => {
+                    *in_comment = false;
+                    rest = &rest[i + 3..];
+                }
+                None => return out,
+            }
+        } else {
+            match rest.find("<!--") {
+                Some(i) => {
+                    out.push_str(&rest[..i]);
+                    *in_comment = true;
+                    rest = &rest[i + 4..];
+                }
+                None => {
+                    out.push_str(rest);
+                    return out;
+                }
+            }
+        }
+    }
+}
+
+/// True when the line holds only markup: HTML tags, images `![..](..)`, and badge wrappers
+/// `[![..](..)](..)`. A line with any readable text (even `[text](url)`) is not markup.
+fn is_markup_line(line: &str) -> bool {
+    let mut rest = line.trim();
+    if rest.is_empty() {
+        return false;
+    }
+    while !rest.is_empty() {
+        rest = if rest.starts_with("[!") {
+            &rest[1..]
+        } else if rest.starts_with('<') {
+            match rest.find('>') {
+                Some(i) => &rest[i + 1..],
+                None => return false,
+            }
+        } else if rest.starts_with("![") {
+            match rest.find("](").and_then(|j| rest[j..].find(')').map(|k| j + k + 1)) {
+                Some(e) => &rest[e..],
+                None => return false,
+            }
+        } else if rest.starts_with("](") || rest.starts_with("][") {
+            // Wrapper tail: `(href)` inline, or `[ref]` for reference-style badges.
+            let close = if rest.starts_with("](") { ')' } else { ']' };
+            match rest[2..].find(close) {
+                Some(e) => &rest[2 + e + 1..],
+                None => return false,
+            }
+        } else {
+            return false;
+        };
+        rest = rest.trim_start();
+    }
+    true
 }
 
 /// `release`: `None` = lookup failed (line omitted); `Some(None)` = no release or tag.
@@ -492,6 +613,22 @@ mod tests {
         let err = pkg("maven", "x").await.unwrap_err().to_string();
         assert!(err.contains("unknown registry 'maven'"), "{err}");
         assert!(err.contains("crates") && err.contains("npm") && err.contains("pypi"));
+    }
+
+    #[test]
+    fn readme_cleaning_drops_badges_and_comments_keeps_code() {
+        let raw = "<p align=\"center\">\n<img src=\"logo.png\">\n</p>\n\n# Axum\n[![CI](https://x/ci.svg)](https://x/ci) [![MIT](https://x/m.svg)](LICENSE)\n[Getting started](docs/start.md)\n\n<!-- TODO\nhidden\n-->\n\n\n\nText with [docs](https://d) and <a href=\"x\">link</a>.\n\n```rust\n![not](badge)\n<!-- keep -->\n\n\nlet x = Vec::<u8>::new();\n```\n";
+        assert_eq!(
+            clean_readme(raw),
+            "# Axum\n[Getting started](docs/start.md)\n\nText with [docs](https://d) and <a href=\"x\">link</a>.\n\n```rust\n![not](badge)\n<!-- keep -->\n\n\nlet x = Vec::<u8>::new();\n```"
+        );
+    }
+
+    #[test]
+    fn readme_cleaning_handles_inline_comment_and_empty() {
+        assert_eq!(clean_readme("a <!-- x --> b\n<!--\n\n-->\nc\n"), "a  b\n\nc");
+        assert_eq!(clean_readme("\n\n  \n"), "");
+        assert_eq!(clean_readme("[![Docs](https://d/b.svg)][docs]\n\nkeep"), "keep");
     }
 
     #[tokio::test]

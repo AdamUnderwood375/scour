@@ -1192,7 +1192,9 @@ usage:
   scour search <query...> [--max N] [--site D] [--freshness day|week|month|year]
                [--fetch N] [--focus Q] [--max-chars N] [--json] [--stats]
                                           --fetch N scrapes the top N hits (max 8)
-  scour gh <owner/repo|github-url>...     GitHub repo: stars, license, latest release
+  scour gh <owner/repo|github-url>... [--readme] [--max-chars N] [--focus Q]
+                                          GitHub repo: stars, license, latest release;
+                                          --readme adds a README excerpt (1500 chars)
   scour pkg <crates|npm|pypi> <name>...   latest version + description
   scour links <url> [--filter S] [--same-site] [--max N]
   scour crawl <url> [--max-pages N] [--depth N] [--focus Q] [--max-chars N] [--sitemap] [--json] [--stats]
@@ -1803,15 +1805,67 @@ async fn cmd_batch(args: &[String]) -> anyhow::Result<()> {
 }
 
 async fn cmd_gh(args: &[String]) -> anyhow::Result<()> {
-    let specs = cap_inputs(positionals(args).unwrap_or_else(|e| usage(&e)), "gh");
+    let mut o = parse_gh(args).unwrap_or_else(|e| usage(&e));
+    let specs = cap_inputs(std::mem::take(&mut o.specs), "gh");
     if specs.is_empty() {
         usage("gh needs at least one owner/repo or github URL");
     }
-    let res = futures::future::join_all(specs.iter().map(|s| tools::gh(s))).await;
+    let o = &o;
+    let res = futures::future::join_all(specs.iter().map(|s| async move {
+        if !o.readme {
+            return tools::gh(s).await;
+        }
+        // README failure is reported inline; only the repo lookup decides success.
+        let (repo, readme) = tokio::join!(tools::gh(s), tools::gh_readme(s));
+        let excerpt = match readme {
+            Ok(text) => {
+                let text = match &o.focus {
+                    Some(q) => focus_filter(&text, q, 5),
+                    None => text,
+                };
+                let (text, cut) = truncate(&text, o.max_chars);
+                let marker = if cut { "\n\n<!-- readme truncated -->" } else { "" };
+                format!("## README (excerpt)\n{}{marker}", text.trim_end())
+            }
+            Err(e) => format!("<!-- readme unavailable: {e} -->"),
+        };
+        Ok(format!("{}\n\n{excerpt}", repo?))
+    }))
+    .await;
     if print_lookups(&specs, res) > 0 {
         std::process::exit(1);
     }
     Ok(())
+}
+
+#[derive(Debug, PartialEq)]
+struct GhOpts {
+    specs: Vec<String>,
+    readme: bool,
+    focus: Option<String>,
+    max_chars: usize,
+}
+
+fn parse_gh(args: &[String]) -> Result<GhOpts, String> {
+    let mut specs = Vec::new();
+    let mut readme = false;
+    let mut focus = None;
+    let mut max_chars = None;
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--readme" => readme = true,
+            "--focus" => focus = Some(flag_value(args, &mut i)?.to_string()),
+            "--max-chars" => max_chars = Some(parse_pos(flag_value(args, &mut i)?, "--max-chars")?),
+            s if s.starts_with('-') => return Err(format!("unknown flag {s}")),
+            s => specs.push(s.to_string()),
+        }
+        i += 1;
+    }
+    if !readme && (focus.is_some() || max_chars.is_some()) {
+        return Err("--focus and --max-chars need --readme".into());
+    }
+    Ok(GhOpts { specs, readme, focus, max_chars: max_chars.unwrap_or(1500) })
 }
 
 /// Registry names `tools::pkg` accepts (case-insensitive, surrounding spaces ignored).
@@ -1954,6 +2008,23 @@ mod cli_tests {
         assert_eq!((o.focus.as_str(), o.max_chars), ("routing", 300));
         assert!(parse_search(&s(&["x", "--bogus"])).is_err());
         assert!(parse_search(&s(&["--fetch", "2"])).is_err());
+    }
+
+    #[test]
+    fn gh_flags_parse() {
+        let o = parse_gh(&s(&["tokio-rs/axum", "actix/actix-web"])).unwrap();
+        assert_eq!((o.specs.len(), o.readme, o.max_chars), (2, false, 1500));
+        assert_eq!(o.focus, None);
+        let o = parse_gh(&s(&["tokio-rs/axum", "--readme", "--focus", "middleware tower", "--max-chars", "600"])).unwrap();
+        assert_eq!(
+            o,
+            GhOpts { specs: s(&["tokio-rs/axum"]), readme: true, focus: Some("middleware tower".into()), max_chars: 600 }
+        );
+        assert!(parse_gh(&s(&["x/y", "--focus", "q"])).is_err());
+        assert!(parse_gh(&s(&["x/y", "--max-chars", "300"])).is_err());
+        assert!(parse_gh(&s(&["x/y", "--readme", "--max-chars", "0"])).is_err());
+        assert!(parse_gh(&s(&["x/y", "--readme", "--bogus"])).is_err());
+        assert!(parse_gh(&s(&["x/y", "--readme", "--focus"])).is_err());
     }
 
     #[test]
