@@ -90,7 +90,7 @@ scour <url> [focus...] [flags]              # scrape one page (same as `scrape`)
 scour scrape <url> [focus...] [--focus Q] [--max-chars N] [--offset N] [--json] [--stats]
 scour batch [urls...] [--focus Q] [--max-chars N] [--parallel N] [--json] [--stats]   # URLs from stdin if none
 scour search <query...> [--max N] [--site D] [--freshness day|week|month|year] [--fetch N] [--focus Q] [--json] [--stats]
-scour gh <owner/repo|github-url>...         # stars, license, latest release
+scour gh <owner/repo|github-url>... [--readme] [--focus Q] [--max-chars N]   # stars, license, latest release; --readme adds a README excerpt
 scour pkg <crates|npm|pypi> <name>...       # latest version + description
 scour links <url> [--filter S] [--same-site] [--max N]
 scour crawl <url> [--max-pages N] [--depth N] [--focus Q] [--max-chars N] [--sitemap] [--json] [--stats]
