@@ -10,7 +10,7 @@ Fast, local, Rust-only web scraper: single pages, batch fetches, site crawls, an
 
 ## What it is
 
-`scour` is one small Rust binary (~4,300 lines across `src/`, edition 2024, MIT) that turns messy web pages into clean markdown for humans and agents. It fetches with plain HTTP when that works, escalates to a headless browser only when blocked, extracts the readable content, and optionally filters long documents down to the paragraphs that match your query.
+`scour` is one small Rust binary (edition 2024, MIT) that turns messy web pages into clean markdown for humans and agents. It fetches with plain HTTP when that works, escalates to a headless browser only when blocked, extracts the readable content, and optionally filters long documents down to the paragraphs that match your query.
 
 ```mermaid
 flowchart LR
@@ -113,9 +113,9 @@ Stdout is markdown (`# title` + meta comment for `scrape`, `## <url>` sections f
 
 When output is cut short it ends with a `<!-- truncated at N of T chars; more: scour scrape '<url>' --offset N ... -->` comment; paste that command to continue (it repeats the focus and max-chars, so the offset lines up). The focus query is often a better first move than paging through a long page: BM25 keeps the relevant paragraphs.
 
-`links` lists every `<a href>` on the page (nav and sidebar included), one `text — url` per line, deduped. `--filter` is a case-insensitive substring match on the URL or text.
+`links` lists every `<a href>` on the page (nav and sidebar included), one `text — url` per line, deduped and capped by `--max` (default 100). `--filter` is a case-insensitive substring match on the URL or text.
 
-Errors print `error: ...` and exit non-zero; bad flags exit 2 with usage. `gh`/`pkg` exit 1 if any lookup failed; `batch` and `search --fetch` exit 1 only when every page failed. `--max-chars` must be at least 1. With no arguments the binary runs as a stdio MCP server instead:
+Runtime errors print `Error: ...` (anyhow) and exit 1. Usage errors (bad flags, unknown `pkg` registry, `--max-chars 0`, `links --max 0`) print `error: ...` plus usage and exit 2. `gh`/`pkg` exit 1 if any lookup failed; `batch` and `search --fetch` exit 1 only when every page failed. `--max-chars` must be at least 1. With no arguments the binary runs as a stdio MCP server instead:
 
 ```sh
 ./target/release/scour
@@ -211,7 +211,7 @@ Field notes: `tier` records which fetch tier served the page; `blocked` / `conte
 
 ## Development and CI
 
-Stack: Rust edition 2024 with `ammonia`, `anyhow`, `base64`, `fs2`, `futures`, `headless_chrome`, `html2md`, `lru`, `readability`, `reqwest` 0.13 (rustls, charset, http2, gzip, brotli, cookies), `rmcp` 3.1 (server + stdio transport), `schemars`, `scraper` 0.24, `serde`/`serde_json`, `tokio`, `url`. 60 tests (56 run by default; 4 live network tests are `#[ignore]`d): `main` 23, `tools` 14, `search` 10, `fetcher` 8, `extractor` 3, `cache` 2.
+Stack: Rust edition 2024 with `ammonia`, `anyhow`, `base64`, `fs2`, `futures`, `headless_chrome`, `html2md`, `lru`, `readability`, `reqwest` 0.13 (rustls, charset, http2, gzip, brotli, cookies), `rmcp` 3.1 (server + stdio transport), `schemars`, `scraper` 0.24, `serde`/`serde_json`, `tokio`, `url`. 74 tests (70 run by default; 4 live `gh`/`pkg` tests in `tools.rs` are `#[ignore]`d): `main` 26, `tools` 16, `search` 12, `fetcher` 9, `extractor` 9, `cache` 2.
 
 ```sh
 cargo test
