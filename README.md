@@ -83,41 +83,45 @@ The release build output lands at `./target/release/scour`.
 
 ## CLI usage
 
-The CLI takes a URL and an optional focus query — no flags:
+`scour --help` prints every subcommand. Summary:
 
 ```sh
-./target/release/scour "https://example.com"
+scour <url> [focus...] [flags]              # scrape one page (same as `scrape`)
+scour scrape <url> [focus...] [--max-chars N] [--offset N] [--json] [--stats]
+scour batch [urls...] [--focus Q] [--max-chars N] [--parallel N] [--json] [--stats]   # URLs from stdin if none
+scour search <query...> [--max N] [--site D] [--freshness day|week|month|year] [--fetch N] [--focus Q] [--json] [--stats]
+scour gh <owner/repo|github-url>...         # stars, license, latest release
+scour pkg <crates|npm|pypi> <name>...       # latest version + description
+scour links <url> [--filter S] [--same-site] [--max N]
+scour crawl <url> [--max-pages N] [--depth N] [--focus Q] [--max-chars N] [--sitemap] [--json] [--stats]
+scour screenshot <url> [-o PATH]            # PNG, default /tmp/scour-<unix_ts>.png
+scour cache-clear
 ```
+
+Examples:
 
 ```sh
-./target/release/scour "https://example.com" "second argument is a BM25 focus query"
+scour "https://example.com" "optional BM25 focus query"
+scour search "axum middleware from_fn" --max 5 --fetch 2     # hits, then the top 2 pages as markdown
+scour gh tokio-rs/axum actix/actix-web
+scour links https://docs.rs/axum/latest/axum/ --filter middleware --max 10
 ```
 
-```sh
-./target/release/scour "https://news.ycombinator.com" 2>&1 | head -n 100
-```
+Defaults: `--max-chars 6000` for `scrape`/`batch`; `--fetch` pages and `crawl` pages use `2500` (`--fetch` focus defaults to the query). `--max-pages` defaults to 10 (max 50), `--depth` to 2. `--fetch` is capped at 8.
 
-```sh
-./target/release/scour "https://example.com" 2>&1 | grep -i "example"
-```
+Stdout is markdown (`# title` + meta comment for `scrape`, `## <url>` sections for `batch`/`search --fetch`/`crawl`). Stderr carries warnings and `next_offset`; `--stats` adds one JSON `stats:` line per fetch. `--json` prints the result struct as JSON instead (batch and `search --fetch` emit an array / a `pages` key; failed fetches become `{url, content_ok:false, error}`).
 
-Stdout contract: line 1 is the page title, the rest is clean markdown. Stderr carries the metadata: `page_type`, `quality`, links count, and `next_offset`. With no arguments the binary runs as a stdio MCP server instead of scraping:
+When output is cut short it ends with `<!-- truncated: rerun with --offset N for more -->`; rerun `scour scrape <url> --offset N` to continue. The focus query is often a better first move than paging through a long page: BM25 keeps the relevant paragraphs.
+
+`links` lists every `<a href>` on the page (nav and sidebar included), one `text — url` per line, deduped. `--filter` is a case-insensitive substring match on the URL or text.
+
+Errors print `error: ...` and exit non-zero; bad flags exit 2 with usage. With no arguments the binary runs as a stdio MCP server instead:
 
 ```sh
 ./target/release/scour
 ```
 
-Once installed to `PATH`, the same invocations work through the installed name:
-
-```sh
-scour "https://example.com"
-```
-
-```sh
-scour "https://example.com" "focus query"
-```
-
-Long pages are walked with `offset` (MCP `scrape` param): when stderr reports a `next_offset`, pass it back as `offset` to fetch the next chunk. When a page is long and you only need one section, prefer a focus query over paging through the whole document — the BM25 filter (below) keeps the relevant paragraphs and drops the rest.
+Once installed to `PATH`, the same invocations work through the installed name (`scour "https://example.com"`).
 
 ## MCP configuration
 

@@ -1,7 +1,8 @@
-//! scour — local MCP scraper. HTTP first, Chrome only when blocked.
+//! scour — local MCP scraper + CLI. HTTP first, Chrome only when blocked.
 //!
 //!   scour            -> MCP server on stdio (for Pi / Claude)
 //!   scour <url>      -> print markdown (smoke test, no MCP client needed)
+//!   scour --help     -> list every CLI subcommand
 //!
 //! Frontier upgrade: article + list fallback, links/page_type, BM25 focus,
 //! batch parallelism, and in-domain crawl.
@@ -21,6 +22,7 @@ use rmcp::{
     schemars, tool, tool_handler, tool_router,
 };
 use std::collections::{HashMap, HashSet, VecDeque};
+use std::net::IpAddr;
 use std::sync::OnceLock;
 use std::time::Duration;
 
@@ -425,7 +427,7 @@ impl Stats {
         bytes_down: usize,
         dropped_paras: usize,
     ) -> Stats {
-        let chars_out = r.markdown.len();
+        let chars_out = r.markdown.chars().count();
         Stats {
             op: "scrape",
             url: r.url.clone(),
@@ -458,20 +460,17 @@ fn validate(url: &str) -> anyhow::Result<()> {
         "http" | "https" => {},
         s => anyhow::bail!("refusing non-http scheme: {s}"),
     }
-    if let Some(host) = u.host_str()
-        && let Ok(ip) = host.parse::<std::net::IpAddr>() {
-            let is_private = match ip {
-                std::net::IpAddr::V4(v4) => v4.is_private(),
-                std::net::IpAddr::V6(v6) => v6.is_unique_local(),
-            };
-            let is_link_local = match ip {
-                std::net::IpAddr::V4(v4) => v4.is_link_local(),
-                std::net::IpAddr::V6(v6) => v6.is_unicast_link_local(),
-            };
-            if ip.is_loopback() || ip.is_unspecified() || is_private || is_link_local {
-                anyhow::bail!("refusing private/loopback/link-local IP: {host}");
-            }
-        }
+    // Literal IPs only; hostnames are checked against resolved IPs in fetcher.
+    let literal = match u.host() {
+        Some(url::Host::Ipv4(v4)) => Some(IpAddr::V4(v4)),
+        Some(url::Host::Ipv6(v6)) => Some(IpAddr::V6(v6)),
+        _ => None,
+    };
+    if let Some(ip) = literal
+        && !fetcher::is_public_ip(ip)
+    {
+        anyhow::bail!("refusing non-public IP: {ip}");
+    }
     Ok(())
 }
 
@@ -514,7 +513,7 @@ fn focus_filter(markdown: &str, query: &str, keep: usize) -> String {
     if scored.is_empty() {
         return markdown.to_string();
     }
-    scored.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
+    scored.sort_by(|a, b| b.0.total_cmp(&a.0));
     scored.truncate(keep);
     scored.sort_by_key(|(_, i, _)| *i);
     scored.into_iter().map(|(_, _, p)| p).collect::<Vec<_>>().join("\n\n")
@@ -524,10 +523,15 @@ fn truncate(md: &str, limit: usize) -> (String, bool) {
     if md.len() <= limit {
         return (md.to_string(), false);
     }
-    let cut = md[..limit]
+    // `limit` is bytes: back off to a char boundary so we never split a codepoint.
+    let mut end = limit;
+    while !md.is_char_boundary(end) {
+        end -= 1;
+    }
+    let cut = md[..end]
         .rfind("\n\n")
-        .filter(|b| *b > limit / 2)
-        .unwrap_or(limit);
+        .filter(|b| *b > end / 2)
+        .unwrap_or(end);
     (md[..cut].to_string(), true)
 }
 
@@ -1043,7 +1047,7 @@ async fn crawl_run(start_url: &str, max_pages: usize, max_depth: usize, focus: O
                     candidates.push((score, href.clone()));
                 }
             }
-            candidates.sort_by(|a,b| b.0.partial_cmp(&a.0).unwrap());
+            candidates.sort_by(|a, b| b.0.total_cmp(&a.0));
             for (_, href) in candidates.into_iter().take(10) {
                 let norm = normalize_url(&href);
                 if visited.insert(norm) {
@@ -1071,7 +1075,8 @@ fn normalize_url(u: &str) -> String {
 }
 
 
-async fn screenshot_run(url: &str) -> anyhow::Result<String> {
+/// Raw PNG bytes of `url`, rendered by the headless browser.
+async fn screenshot_png(url: &str) -> anyhow::Result<Vec<u8>> {
     validate(url)?;
     let fetcher_browser = fetcher::get_browser()?;
     let tab = {
@@ -1084,23 +1089,60 @@ async fn screenshot_run(url: &str) -> anyhow::Result<String> {
     std::thread::sleep(std::time::Duration::from_millis(1500));
     let png = tab.capture_screenshot(headless_chrome::protocol::cdp::Page::CaptureScreenshotFormatOption::Png, None, None, true)?;
     let _ = tab.close(true);
+    Ok(png)
+}
+
+/// Base64 PNG for the MCP tool (truncated preview).
+async fn screenshot_run(url: &str) -> anyhow::Result<String> {
+    let png = screenshot_png(url).await?;
     use base64::{Engine as _, engine::general_purpose};
     let b64 = general_purpose::STANDARD.encode(&png);
     Ok(if b64.len() > 20000 { format!("{}...[truncated {} bytes]", &b64[..20000], png.len()) } else { b64 })
 }
 
-fn usage() -> ! {
-    eprintln!(
-        "usage:\n  \
-         scour <url> [focus...]                 scrape (shim)\n  \
-         scour scrape <url> [focus...] [--max-chars N] [--stats]\n  \
-         scour search <query...> [--max N] [--site DOMAIN] [--freshness day|week|month|year] [--stats]\n  \
-         scour batch [urls...] [--focus \"...\"] [--max-chars N] [--parallel N] [--stats]  (urls from stdin if omitted)\n  \
-         scour cache-clear\n  \
-         scour --version | -V\n  \
-         scour                                   MCP stdio server"
-    );
-    std::process::exit(2);
+// ── CLI ─────────────────────────────────────────────────────────────────────
+
+const USAGE: &str = "\
+scour - local web scraper for agents (HTTP first, headless Chrome when blocked)
+
+usage:
+  scour <url> [focus...] [flags]          scrape one page (same as `scrape`)
+  scour scrape <url> [focus...] [--max-chars N] [--offset N] [--json] [--stats]
+  scour batch [urls...] [--focus Q] [--max-chars N] [--parallel N] [--json] [--stats]
+                                          urls from stdin if none (# lines are comments)
+  scour search <query...> [--max N] [--site D] [--freshness day|week|month|year]
+               [--fetch N] [--focus Q] [--max-chars N] [--json] [--stats]
+                                          --fetch N scrapes the top N hits (max 8)
+  scour gh <owner/repo|github-url>...     GitHub repo: stars, license, latest release
+  scour pkg <crates|npm|pypi> <name>...   latest version + description
+  scour links <url> [--filter S] [--same-site] [--max N]
+  scour crawl <url> [--max-pages N] [--depth N] [--focus Q] [--max-chars N] [--sitemap] [--json] [--stats]
+  scour screenshot <url> [-o PATH]        PNG (default /tmp/scour-<unix_ts>.png)
+  scour cache-clear
+  scour --version | -V | --help | -h
+  scour                                   MCP stdio server
+
+defaults: --max-chars 6000 (scrape, batch), 2500 (search --fetch, crawl per page);
+          --max-pages 10 (max 50); --depth 2; --max 10 (search), 100 (links)
+";
+
+/// `--help`, `-h` or `help` as the first token.
+fn is_help(arg: Option<&str>) -> bool {
+    matches!(arg, Some("--help" | "-h" | "help"))
+}
+
+/// Usage error: message and usage on stderr, exit 2.
+fn usage(msg: &str) -> ! {
+    eprintln!("error: {msg}\n\n{USAGE}");
+    std::process::exit(2)
+}
+
+/// Markdown body plus the pagination hint when there is more to read.
+fn with_hint(markdown: &str, next_offset: Option<usize>) -> String {
+    match next_offset {
+        Some(n) => format!("{markdown}\n\n<!-- truncated: rerun with --offset {n} for more -->"),
+        None => markdown.to_string(),
+    }
 }
 
 // Shared markdown emitter for the shim and the `scrape` subcommand.
@@ -1108,97 +1150,319 @@ fn emit_scrape(r: &ScrapeResult) {
     if let Some(n) = &r.note { eprintln!("warning: {n}"); }
     if let Some(a) = &r.next_action { eprintln!("next: {a}"); }
     eprintln!("page_type: {} quality: {:.2} links: {} headings: {} next_offset: {:?} media: {}", r.page_type, r.quality_score, r.links.len(), r.headings.len(), r.next_offset, r.media.len());
-    println!("# {}\n<!-- tier: {} content_ok: {} chars: {} -->\n\n{}", r.title, r.tier, r.content_ok, r.total_chars, r.markdown);
+    println!("# {}\n<!-- tier: {} content_ok: {} chars: {} -->\n\n{}", r.title, r.tier, r.content_ok, r.total_chars, with_hint(&r.markdown, r.next_offset));
 }
 
-async fn cmd_scrape(args: &[String]) -> anyhow::Result<()> {
-    let mut url: Option<String> = None;
-    let mut focus_words: Vec<String> = Vec::new();
-    let mut max_chars = 40_000usize;
-    let mut stats = false;
+/// Value of the flag at `args[*i]`; leaves `*i` on the value.
+fn flag_value<'a>(args: &'a [String], i: &mut usize) -> Result<&'a str, String> {
+    *i += 1;
+    match args.get(*i) {
+        Some(v) => Ok(v.as_str()),
+        None => Err(format!("{} needs a value", args[*i - 1])),
+    }
+}
+
+fn parse_num<T: std::str::FromStr>(s: &str, flag: &str) -> Result<T, String> {
+    s.parse().map_err(|_| format!("{flag} needs a number, got '{s}'"))
+}
+
+/// Non-flag args for subcommands without flags beyond the list itself.
+fn positionals(args: &[String]) -> Result<Vec<String>, String> {
+    if let Some(f) = args.iter().find(|a| a.starts_with('-')) {
+        return Err(format!("unknown flag {f}"));
+    }
+    Ok(args.to_vec())
+}
+
+fn one_url(mut words: Vec<String>) -> Result<String, String> {
+    match words.len() {
+        0 => Err("missing <url>".into()),
+        1 => Ok(words.remove(0)),
+        _ => Err(format!("unexpected argument {}", words[1])),
+    }
+}
+
+#[derive(Debug, PartialEq)]
+struct ScrapeOpts {
+    url: String,
+    focus: Option<String>,
+    max_chars: usize,
+    offset: Option<usize>,
+    json: bool,
+    stats: bool,
+}
+
+fn parse_scrape(args: &[String]) -> Result<ScrapeOpts, String> {
+    let mut o = ScrapeOpts { url: String::new(), focus: None, max_chars: 6000, offset: None, json: false, stats: false };
+    let mut words = Vec::new();
     let mut i = 0;
     while i < args.len() {
         match args[i].as_str() {
-            "--max-chars" => { i += 1; max_chars = args.get(i).and_then(|s| s.parse().ok()).unwrap_or(40_000); }
-            "--stats" => stats = true,
-            s if s.starts_with("--") => usage(),
-            s => { if url.is_none() { url = Some(s.to_string()); } else { focus_words.push(s.to_string()); } }
+            "--max-chars" => o.max_chars = parse_num(flag_value(args, &mut i)?, "--max-chars")?,
+            "--offset" => o.offset = Some(parse_num(flag_value(args, &mut i)?, "--offset")?),
+            "--json" => o.json = true,
+            "--stats" => o.stats = true,
+            s if s.starts_with('-') => return Err(format!("unknown flag {s}")),
+            s => words.push(s.to_string()),
         }
         i += 1;
     }
-    let url = match url { Some(u) => u, None => usage() };
-    let focus = (!focus_words.is_empty()).then(|| focus_words.join(" "));
-    let (r, st) = run_ext_stats(&url, focus.as_deref(), max_chars, true, None, false, None, None).await?;
-    emit_scrape(&r);
-    if stats { st.print(); }
-    Ok(())
+    if words.is_empty() {
+        return Err("missing <url>".into());
+    }
+    o.url = words.remove(0);
+    o.focus = (!words.is_empty()).then(|| words.join(" "));
+    Ok(o)
 }
 
-async fn cmd_search(args: &[String]) -> anyhow::Result<()> {
-    let mut query_words: Vec<String> = Vec::new();
-    let mut max = 10usize;
-    let mut site: Option<String> = None;
-    let mut freshness: Option<String> = None;
-    let mut stats = false;
+#[derive(Debug, PartialEq)]
+struct BatchOpts {
+    urls: Vec<String>,
+    focus: Option<String>,
+    max_chars: usize,
+    parallel: usize,
+    json: bool,
+    stats: bool,
+}
+
+fn parse_batch(args: &[String]) -> Result<BatchOpts, String> {
+    let mut o = BatchOpts { urls: Vec::new(), focus: None, max_chars: 6000, parallel: 4, json: false, stats: false };
     let mut i = 0;
     while i < args.len() {
         match args[i].as_str() {
-            "--max" => { i += 1; max = args.get(i).and_then(|s| s.parse().ok()).unwrap_or(10); }
-            "--site" => { i += 1; site = args.get(i).cloned(); }
-            "--freshness" => { i += 1; freshness = args.get(i).cloned(); }
-            "--stats" => stats = true,
-            s if s.starts_with("--") => usage(),
-            s => query_words.push(s.to_string()),
+            "--focus" => o.focus = Some(flag_value(args, &mut i)?.to_string()),
+            "--max-chars" => o.max_chars = parse_num(flag_value(args, &mut i)?, "--max-chars")?,
+            "--parallel" => o.parallel = parse_num(flag_value(args, &mut i)?, "--parallel")?,
+            "--json" => o.json = true,
+            "--stats" => o.stats = true,
+            s if s.starts_with('-') => return Err(format!("unknown flag {s}")),
+            s => o.urls.push(s.to_string()),
         }
         i += 1;
     }
-    let query = query_words.join(" ");
-    if query.is_empty() { usage(); }
-    let t0 = std::time::Instant::now();
-    let hits = search_run(&query, max.clamp(1, 20), site.as_deref(), None, freshness.as_deref()).await?;
-    let ms = t0.elapsed().as_millis();
-    println!("# {query}");
-    for (idx, h) in hits.iter().enumerate() {
-        println!("{}. {} — {}", idx + 1, h.title, h.url);
-        if !h.snippet.is_empty() { println!("   {}", h.snippet); }
-    }
-    if stats {
-        eprintln!("stats: {}", serde_json::json!({"op":"search","query":query,"hits":hits.len(),"ms":ms}));
-    }
-    Ok(())
+    Ok(o)
 }
 
-async fn cmd_batch(args: &[String]) -> anyhow::Result<()> {
-    let mut urls: Vec<String> = Vec::new();
-    let mut focus: Option<String> = None;
-    let mut max_chars = 40_000usize;
-    let mut parallel = 4usize;
-    let mut stats = false;
+/// Batch URLs from stdin: one per line; blanks and `#` comments are skipped.
+fn parse_url_lines(text: &str) -> Vec<String> {
+    text.lines()
+        .map(str::trim)
+        .filter(|l| !l.is_empty() && !l.starts_with('#'))
+        .map(String::from)
+        .collect()
+}
+
+#[derive(Debug, PartialEq)]
+struct SearchOpts {
+    query: String,
+    max: usize,
+    site: Option<String>,
+    freshness: Option<String>,
+    fetch: usize,
+    focus: String,
+    max_chars: usize,
+    json: bool,
+    stats: bool,
+}
+
+fn parse_search(args: &[String]) -> Result<SearchOpts, String> {
+    let mut o = SearchOpts {
+        query: String::new(),
+        max: 10,
+        site: None,
+        freshness: None,
+        fetch: 0,
+        focus: String::new(),
+        max_chars: 2500,
+        json: false,
+        stats: false,
+    };
+    let mut words = Vec::new();
+    let mut focus = None;
     let mut i = 0;
     while i < args.len() {
         match args[i].as_str() {
-            "--focus" => { i += 1; focus = args.get(i).cloned(); }
-            "--max-chars" => { i += 1; max_chars = args.get(i).and_then(|s| s.parse().ok()).unwrap_or(40_000); }
-            "--parallel" => { i += 1; parallel = args.get(i).and_then(|s| s.parse().ok()).unwrap_or(4); }
-            "--stats" => stats = true,
-            s if s.starts_with("--") => usage(),
-            s => urls.push(s.to_string()),
+            "--max" => o.max = parse_num(flag_value(args, &mut i)?, "--max")?,
+            "--site" => o.site = Some(flag_value(args, &mut i)?.to_string()),
+            "--freshness" => o.freshness = Some(flag_value(args, &mut i)?.to_string()),
+            "--fetch" => o.fetch = parse_num::<usize>(flag_value(args, &mut i)?, "--fetch")?.min(8),
+            "--focus" => focus = Some(flag_value(args, &mut i)?.to_string()),
+            "--max-chars" => o.max_chars = parse_num(flag_value(args, &mut i)?, "--max-chars")?,
+            "--json" => o.json = true,
+            "--stats" => o.stats = true,
+            s if s.starts_with('-') => return Err(format!("unknown flag {s}")),
+            s => words.push(s.to_string()),
         }
         i += 1;
     }
-    if urls.is_empty() {
-        use std::io::Read;
-        let mut buf = String::new();
-        std::io::stdin().read_to_string(&mut buf)?;
-        urls = buf.split_whitespace().map(|s| s.to_string()).collect();
+    if words.is_empty() {
+        return Err("missing <query>".into());
     }
-    urls.truncate(20);
-    if urls.is_empty() { usage(); }
-    let parallel = parallel.clamp(1, 8);
+    o.query = words.join(" ");
+    o.focus = focus.unwrap_or_else(|| o.query.clone());
+    o.max = o.max.clamp(1, 20);
+    Ok(o)
+}
+
+#[derive(Debug, PartialEq)]
+struct LinksOpts {
+    url: String,
+    filter: Option<String>,
+    same_site: bool,
+    max: usize,
+}
+
+fn parse_links(args: &[String]) -> Result<LinksOpts, String> {
+    let mut words = Vec::new();
+    let mut filter = None;
+    let mut same_site = false;
+    let mut max = 100;
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--filter" => filter = Some(flag_value(args, &mut i)?.to_string()),
+            "--same-site" => same_site = true,
+            "--max" => max = parse_num(flag_value(args, &mut i)?, "--max")?,
+            s if s.starts_with('-') => return Err(format!("unknown flag {s}")),
+            s => words.push(s.to_string()),
+        }
+        i += 1;
+    }
+    Ok(LinksOpts { url: one_url(words)?, filter, same_site, max })
+}
+
+#[derive(Debug, PartialEq)]
+struct CrawlOpts {
+    url: String,
+    max_pages: usize,
+    depth: usize,
+    focus: Option<String>,
+    max_chars: usize,
+    sitemap: bool,
+    json: bool,
+    stats: bool,
+}
+
+fn parse_crawl(args: &[String]) -> Result<CrawlOpts, String> {
+    let mut words = Vec::new();
+    let mut o = CrawlOpts { url: String::new(), max_pages: 10, depth: 2, focus: None, max_chars: 2500, sitemap: false, json: false, stats: false };
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--max-pages" => o.max_pages = parse_num(flag_value(args, &mut i)?, "--max-pages")?,
+            "--depth" => o.depth = parse_num(flag_value(args, &mut i)?, "--depth")?,
+            "--focus" => o.focus = Some(flag_value(args, &mut i)?.to_string()),
+            "--max-chars" => o.max_chars = parse_num(flag_value(args, &mut i)?, "--max-chars")?,
+            "--sitemap" => o.sitemap = true,
+            "--json" => o.json = true,
+            "--stats" => o.stats = true,
+            s if s.starts_with('-') => return Err(format!("unknown flag {s}")),
+            s => words.push(s.to_string()),
+        }
+        i += 1;
+    }
+    o.url = one_url(words)?;
+    o.max_pages = o.max_pages.clamp(1, 50);
+    Ok(o)
+}
+
+/// `(url, -o path)`.
+fn parse_screenshot(args: &[String]) -> Result<(String, Option<String>), String> {
+    let mut words = Vec::new();
+    let mut out = None;
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "-o" => out = Some(flag_value(args, &mut i)?.to_string()),
+            s if s.starts_with('-') => return Err(format!("unknown flag {s}")),
+            s => words.push(s.to_string()),
+        }
+        i += 1;
+    }
+    Ok((one_url(words)?, out))
+}
+
+/// Every `<a href>` on the page as absolute URLs. Uncapped and unfiltered (unlike
+/// `extractor::extract`, which keeps only the first 100 text-bearing links).
+fn page_links(html: &str, base_url: &str) -> Vec<extractor::Link> {
+    let doc = scraper::Html::parse_document(html);
+    let sel = scraper::Selector::parse("a[href]").unwrap();
+    let base = url::Url::parse(base_url).ok();
+    doc.select(&sel)
+        .filter_map(|el| {
+            let href = el.value().attr("href")?.trim();
+            if href.is_empty() || href.starts_with('#') || href.starts_with("javascript:") {
+                return None;
+            }
+            let abs = match &base {
+                Some(b) => b.join(href).ok()?.to_string(),
+                None => href.to_string(),
+            };
+            Some(extractor::Link { href: abs, text: el.text().collect::<Vec<_>>().join(" ") })
+        })
+        .collect()
+}
+
+/// `links`: dedupe by href, optional case-insensitive substring on href or
+/// text, optional same-host filter, capped at `max`. Returns (text, href).
+fn filter_links(links: &[extractor::Link], page_url: &str, filter: Option<&str>, same_site: bool, max: usize) -> Vec<(String, String)> {
+    let page_host = url::Url::parse(page_url).ok().and_then(|u| u.host_str().map(str::to_lowercase));
+    let needle = filter.map(str::to_lowercase);
+    let mut seen: HashSet<String> = HashSet::new();
+    let mut out = Vec::new();
+    for l in links {
+        if out.len() >= max {
+            break;
+        }
+        if seen.contains(&l.href) {
+            continue;
+        }
+        let text = l.text.split_whitespace().collect::<Vec<_>>().join(" ");
+        if let Some(n) = &needle
+            && !l.href.to_lowercase().contains(n.as_str())
+            && !text.to_lowercase().contains(n.as_str())
+        {
+            continue;
+        }
+        if same_site {
+            let host = url::Url::parse(&l.href).ok().and_then(|u| u.host_str().map(str::to_lowercase));
+            if host.is_none() || host != page_host {
+                continue;
+            }
+        }
+        seen.insert(l.href.clone());
+        let text: String = if text.is_empty() { "(no text)".to_string() } else { text.chars().take(100).collect() };
+        out.push((text, l.href.clone()));
+    }
+    out
+}
+
+/// `gh`/`pkg` lookups printed in input order, blank-line separated. Failures
+/// print inline as `error: <key>: <msg>`. Returns false if every lookup failed.
+fn print_lookups(keys: &[String], results: Vec<anyhow::Result<String>>) -> bool {
+    let mut any_ok = false;
+    for (i, (key, res)) in keys.iter().zip(results).enumerate() {
+        if i > 0 {
+            println!();
+        }
+        match res {
+            Ok(md) => {
+                any_ok = true;
+                println!("{}", md.trim_end());
+            }
+            Err(e) => println!("error: {key}: {e}"),
+        }
+    }
+    any_ok
+}
+
+/// One fetched URL: input URL plus its scrape (or error), in input order.
+type PageFetch = (String, anyhow::Result<(ScrapeResult, Stats)>);
+
+/// Scrapes `urls` concurrently (at most `parallel`, clamped 1..=8), results in input order.
+async fn fetch_all(urls: Vec<String>, focus: Option<String>, max_chars: usize, parallel: usize) -> Vec<PageFetch> {
     let n = urls.len();
-
-    let t0 = std::time::Instant::now();
-    let sem = std::sync::Arc::new(tokio::sync::Semaphore::new(parallel));
+    let sem = std::sync::Arc::new(tokio::sync::Semaphore::new(parallel.clamp(1, 8)));
     let mut set = tokio::task::JoinSet::new();
     for (idx, url) in urls.into_iter().enumerate() {
         let sem = sem.clone();
@@ -1206,43 +1470,211 @@ async fn cmd_batch(args: &[String]) -> anyhow::Result<()> {
         set.spawn(async move {
             let _permit = sem.acquire_owned().await;
             let res = run_ext_stats(&url, focus.as_deref(), max_chars, true, None, false, None, None).await;
-            (idx, url, res)
+            (idx, url, res.map(|(r, mut st)| {
+                st.op = "batch_item";
+                (r, st)
+            }))
         });
     }
-    type BatchSlot = Option<(String, anyhow::Result<(ScrapeResult, Stats)>)>;
-    let mut slots: Vec<BatchSlot> = (0..n).map(|_| None).collect();
+    let mut slots: Vec<Option<PageFetch>> = (0..n).map(|_| None).collect();
     while let Some(joined) = set.join_next().await {
         if let Ok((idx, url, res)) = joined {
             slots[idx] = Some((url, res));
         }
     }
+    slots.into_iter().flatten().collect()
+}
 
-    let mut total_chars = 0usize;
-    let mut ok = 0usize;
-    for slot in slots {
-        let Some((url, res)) = slot else { continue; };
+/// Markdown section for one scraped page (`## url`, meta comment, body).
+fn fetched_md(url: &str, r: &ScrapeResult) -> String {
+    format!("## {url}\n<!-- tier: {} content_ok: {} chars: {} -->\n\n{}", r.tier, r.content_ok, r.total_chars, with_hint(&r.markdown, r.next_offset))
+}
+
+fn print_pages_md(pages: &[PageFetch]) {
+    for (url, res) in pages {
         match res {
-            Ok((r, mut st)) => {
-                println!("## {}\n<!-- tier: {} content_ok: {} chars: {} -->\n\n{}", url, r.tier, r.content_ok, r.total_chars, r.markdown);
-                total_chars += r.markdown.len();
-                if r.content_ok { ok += 1; }
-                if stats { st.op = "batch_item"; st.print(); }
-            }
-            Err(e) => {
-                println!("## {}\n<!-- tier: error content_ok: false chars: 0 -->\n\n_fetch failed: {e}_", url);
-            }
+            Ok((r, _)) => println!("{}\n", fetched_md(url, r)),
+            Err(e) => println!("## {url}\n<!-- tier: error content_ok: false chars: 0 -->\n\n_fetch failed: {e}_\n"),
         }
     }
-    if stats {
-        eprintln!("stats: {}", serde_json::json!({"op":"batch","n":n,"ms":t0.elapsed().as_millis(),"chars_out":total_chars,"est_tokens":total_chars/4,"ok":ok}));
+}
+
+/// JSON for one page; failed fetches become `{url, content_ok:false, error}`.
+fn page_json(url: &str, res: &anyhow::Result<(ScrapeResult, Stats)>) -> serde_json::Value {
+    match res {
+        Ok((r, _)) => serde_json::to_value(r).unwrap_or_default(),
+        Err(e) => serde_json::json!({"url": url, "content_ok": false, "error": e.to_string()}),
     }
+}
+
+fn print_item_stats(pages: &[PageFetch]) {
+    for (_, res) in pages {
+        if let Ok((_, st)) = res {
+            st.print();
+        }
+    }
+}
+
+async fn cmd_scrape(args: &[String]) -> anyhow::Result<()> {
+    let o = parse_scrape(args).unwrap_or_else(|e| usage(&e));
+    let (r, st) = run_ext_stats(&o.url, o.focus.as_deref(), o.max_chars, true, o.offset, false, None, None).await?;
+    if o.json {
+        println!("{}", serde_json::to_string(&r)?);
+    } else {
+        emit_scrape(&r);
+    }
+    if o.stats {
+        st.print();
+    }
+    Ok(())
+}
+
+async fn cmd_search(args: &[String]) -> anyhow::Result<()> {
+    let o = parse_search(args).unwrap_or_else(|e| usage(&e));
+    let t0 = std::time::Instant::now();
+    let hits = search_run(&o.query, o.max, o.site.as_deref(), None, o.freshness.as_deref()).await?;
+    let ms = t0.elapsed().as_millis();
+    let pages = if o.fetch > 0 {
+        let urls: Vec<String> = hits.iter().take(o.fetch).map(|h| h.url.clone()).collect();
+        fetch_all(urls, Some(o.focus.clone()), o.max_chars, 4).await
+    } else {
+        Vec::new()
+    };
+    let sr = SearchResult { query: o.query.clone(), total: hits.len(), hits };
+    if o.json {
+        let mut v = serde_json::to_value(&sr)?;
+        if o.fetch > 0 {
+            v["pages"] = pages.iter().map(|(u, r)| page_json(u, r)).collect();
+        }
+        println!("{v}");
+    } else {
+        println!("# {}", sr.query);
+        for (idx, h) in sr.hits.iter().enumerate() {
+            println!("{}. {} — {}", idx + 1, h.title, h.url);
+            if !h.snippet.is_empty() {
+                println!("   {}", h.snippet);
+            }
+        }
+        if o.fetch > 0 {
+            println!();
+            print_pages_md(&pages);
+        }
+    }
+    if o.stats {
+        print_item_stats(&pages);
+        eprintln!("stats: {}", serde_json::json!({"op":"search","query":&o.query,"hits":sr.total,"ms":ms}));
+    }
+    Ok(())
+}
+
+async fn cmd_batch(args: &[String]) -> anyhow::Result<()> {
+    let mut o = parse_batch(args).unwrap_or_else(|e| usage(&e));
+    if o.urls.is_empty() {
+        use std::io::Read;
+        let mut buf = String::new();
+        std::io::stdin().read_to_string(&mut buf)?;
+        o.urls = parse_url_lines(&buf);
+    }
+    o.urls.truncate(20);
+    if o.urls.is_empty() {
+        usage("no URLs given (args or stdin)");
+    }
+    let n = o.urls.len();
+    let t0 = std::time::Instant::now();
+    let pages = fetch_all(o.urls, o.focus.clone(), o.max_chars, o.parallel).await;
+    if o.json {
+        let arr: Vec<serde_json::Value> = pages.iter().map(|(u, r)| page_json(u, r)).collect();
+        println!("{}", serde_json::Value::Array(arr));
+    } else {
+        print_pages_md(&pages);
+    }
+    if o.stats {
+        print_item_stats(&pages);
+        let ok = pages.iter().filter(|(_, r)| matches!(r, Ok((d, _)) if d.content_ok)).count();
+        let chars: usize = pages
+            .iter()
+            .filter_map(|(_, r)| r.as_ref().ok())
+            .map(|(d, _)| d.markdown.chars().count())
+            .sum();
+        eprintln!("stats: {}", serde_json::json!({"op":"batch","n":n,"ms":t0.elapsed().as_millis(),"chars_out":chars,"est_tokens":chars/4,"ok":ok}));
+    }
+    Ok(())
+}
+
+async fn cmd_gh(args: &[String]) -> anyhow::Result<()> {
+    let specs = positionals(args).unwrap_or_else(|e| usage(&e));
+    if specs.is_empty() {
+        usage("gh needs at least one owner/repo or github URL");
+    }
+    let res = futures::future::join_all(specs.iter().map(|s| tools::gh(s))).await;
+    if !print_lookups(&specs, res) {
+        std::process::exit(1);
+    }
+    Ok(())
+}
+
+async fn cmd_pkg(args: &[String]) -> anyhow::Result<()> {
+    let mut words = positionals(args).unwrap_or_else(|e| usage(&e));
+    if words.len() < 2 {
+        usage("pkg needs a registry (crates|npm|pypi) and at least one name");
+    }
+    let registry = words.remove(0);
+    let res = futures::future::join_all(words.iter().map(|n| tools::pkg(&registry, n))).await;
+    if !print_lookups(&words, res) {
+        std::process::exit(1);
+    }
+    Ok(())
+}
+
+async fn cmd_links(args: &[String]) -> anyhow::Result<()> {
+    let o = parse_links(args).unwrap_or_else(|e| usage(&e));
+    validate(&o.url)?;
+    let got = fetcher::fetch(&o.url).await?;
+    for (text, href) in filter_links(&page_links(&got.html, &o.url), &o.url, o.filter.as_deref(), o.same_site, o.max) {
+        println!("{text} — {href}");
+    }
+    Ok(())
+}
+
+async fn cmd_crawl(args: &[String]) -> anyhow::Result<()> {
+    let o = parse_crawl(args).unwrap_or_else(|e| usage(&e));
+    let t0 = std::time::Instant::now();
+    let res = crawl_run(&o.url, o.max_pages, o.depth, o.focus.as_deref(), o.max_chars, Some(o.sitemap), None, None).await?;
+    if o.json {
+        println!("{}", serde_json::to_string(&res)?);
+    } else {
+        for p in &res.pages {
+            println!("{}\n", fetched_md(&p.url, p));
+        }
+    }
+    if o.stats {
+        eprintln!("stats: {}", serde_json::json!({"op":"crawl","start_url":&o.url,"pages":res.pages.len(),"visited":res.visited.len(),"total_chars":res.total_chars,"ms":t0.elapsed().as_millis()}));
+    }
+    Ok(())
+}
+
+async fn cmd_screenshot(args: &[String]) -> anyhow::Result<()> {
+    let (url, out) = parse_screenshot(args).unwrap_or_else(|e| usage(&e));
+    let png = screenshot_png(&url).await?;
+    let path = out.unwrap_or_else(|| {
+        let ts = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
+        format!("/tmp/scour-{ts}.png")
+    });
+    std::fs::write(&path, &png)?;
+    println!("{path}");
     Ok(())
 }
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     let args: Vec<String> = std::env::args().skip(1).collect();
-    match args.first().map(|s| s.as_str()) {
+    let cmd = args.first().map(String::as_str);
+    if is_help(cmd) {
+        print!("{USAGE}");
+        return Ok(());
+    }
+    match cmd {
+        None => {}
         Some("--version" | "-V") => {
             println!("{}", serde_json::to_string(&version_info()).unwrap_or_default());
             return Ok(());
@@ -1250,25 +1682,118 @@ async fn main() -> anyhow::Result<()> {
         Some("scrape") => return cmd_scrape(&args[1..]).await,
         Some("search") => return cmd_search(&args[1..]).await,
         Some("batch") => return cmd_batch(&args[1..]).await,
+        Some("gh") => return cmd_gh(&args[1..]).await,
+        Some("pkg") => return cmd_pkg(&args[1..]).await,
+        Some("links") => return cmd_links(&args[1..]).await,
+        Some("crawl") => return cmd_crawl(&args[1..]).await,
+        Some("screenshot") => return cmd_screenshot(&args[1..]).await,
         Some("cache-clear") => {
             cache::cache_clear();
             eprintln!("cache cleared");
             return Ok(());
         }
-        // Unknown first token: back-compat shim — treat args as `<url> [focus...]`.
-        Some(_) => {
-            let url = &args[0];
-            let focus = (args.len() > 1).then(|| args[1..].join(" "));
-            let r = run(url, focus.as_deref(), 40_000, true).await?;
-            emit_scrape(&r);
-            return Ok(());
-        }
-        None => {}
+        Some(s) if s.starts_with('-') => usage(&format!("unknown option {s}")),
+        // Bare URL: shorthand for `scrape <url> [focus...] [flags]`.
+        Some(_) => return cmd_scrape(&args).await,
     }
     use rmcp::ServiceExt;
     let service = Scour::new().serve(rmcp::transport::stdio()).await?;
     service.waiting().await?;
     Ok(())
+}
+
+#[cfg(test)]
+mod cli_tests {
+    use super::*;
+
+    fn s(v: &[&str]) -> Vec<String> {
+        v.iter().map(|x| x.to_string()).collect()
+    }
+
+    #[test]
+    fn help_flags_detected() {
+        for h in ["--help", "-h", "help"] {
+            assert!(is_help(Some(h)));
+        }
+        assert!(!is_help(None));
+        assert!(!is_help(Some("https://example.com")));
+        assert!(!is_help(Some("scrape")));
+    }
+
+    #[test]
+    fn search_fetch_defaults() {
+        let o = parse_search(&s(&["axum middleware", "--fetch", "2"])).unwrap();
+        assert_eq!((o.fetch, o.max, o.max_chars), (2, 10, 2500));
+        assert_eq!(o.focus, "axum middleware");
+        assert_eq!(parse_search(&s(&["x", "--fetch", "50"])).unwrap().fetch, 8);
+        let o = parse_search(&s(&["x", "--focus", "routing", "--max-chars", "300"])).unwrap();
+        assert_eq!((o.focus.as_str(), o.max_chars), ("routing", 300));
+        assert!(parse_search(&s(&["x", "--bogus"])).is_err());
+        assert!(parse_search(&s(&["--fetch", "2"])).is_err());
+    }
+
+    #[test]
+    fn links_filter_dedupes_and_scopes() {
+        let l = |href: &str, text: &str| extractor::Link { href: href.into(), text: text.into() };
+        let links = vec![
+            l("https://docs.rs/axum/latest/axum/middleware/index.html", "Middleware"),
+            l("https://docs.rs/axum/latest/axum/middleware/index.html", "Middleware"),
+            l("https://github.com/tokio-rs/axum", "GitHub"),
+            l("https://docs.rs/axum/latest/axum/routing/", "  Routing\n  Guide "),
+        ];
+        let page = "https://docs.rs/axum/latest/axum/";
+        let all = filter_links(&links, page, None, false, 100);
+        assert_eq!(all.len(), 3);
+        assert_eq!(all[2].0, "Routing Guide");
+        assert_eq!(filter_links(&links, page, Some("MIDDLEWARE"), false, 100).len(), 1);
+        assert_eq!(filter_links(&links, page, Some("github"), false, 100).len(), 1);
+        let same = filter_links(&links, page, None, true, 100);
+        assert_eq!(same.len(), 2);
+        assert!(same.iter().all(|(_, h)| h.starts_with("https://docs.rs")));
+        assert_eq!(filter_links(&links, page, None, false, 1).len(), 1);
+    }
+
+    #[test]
+    fn page_links_resolves_and_skips_anchors() {
+        let html = r##"<a href="/x">X</a><a href="#top">top</a><a href="javascript:void(0)">j</a><a href="https://o.com/y"></a>"##;
+        let hrefs: Vec<String> = page_links(html, "https://e.com/a/").into_iter().map(|l| l.href).collect();
+        assert_eq!(hrefs, vec!["https://e.com/x", "https://o.com/y"]);
+    }
+
+    #[test]
+    fn truncation_hint_only_when_more_to_read() {
+        assert_eq!(with_hint("abc", None), "abc");
+        assert_eq!(with_hint("abc", Some(150)), "abc\n\n<!-- truncated: rerun with --offset 150 for more -->");
+    }
+
+    #[test]
+    fn truncate_never_splits_a_char() {
+        let (out, cut) = truncate(&"é".repeat(10), 5);
+        assert!(cut);
+        assert_eq!(out, "éé");
+    }
+
+    #[test]
+    fn scrape_parses_offset_focus_and_rejects_unknown() {
+        let o = parse_scrape(&s(&["https://e.com", "rust", "traits", "--offset", "6000", "--json"])).unwrap();
+        assert_eq!(o.url, "https://e.com");
+        assert_eq!(o.focus.as_deref(), Some("rust traits"));
+        assert_eq!((o.offset, o.max_chars, o.json), (Some(6000), 6000, true));
+        assert!(parse_scrape(&s(&["https://e.com", "--nope"])).is_err());
+        assert!(parse_scrape(&s(&["--stats"])).is_err());
+    }
+
+    #[test]
+    fn stdin_urls_trimmed_and_comments_skipped() {
+        let got = parse_url_lines("  https://a.com \n\n# note\nhttps://b.com\n   # indented\n");
+        assert_eq!(got, vec!["https://a.com", "https://b.com"]);
+    }
+
+    #[test]
+    fn crawl_caps_max_pages() {
+        assert_eq!(parse_crawl(&s(&["https://e.com", "--max-pages", "999"])).unwrap().max_pages, 50);
+        assert_eq!(parse_crawl(&s(&["https://e.com"])).unwrap().max_pages, 10);
+    }
 }
 
 #[cfg(test)]
