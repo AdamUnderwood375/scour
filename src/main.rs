@@ -196,6 +196,9 @@ pub struct CrawlResult {
     pub pages: Vec<ScrapeResult>,
     pub visited: Vec<String>,
     pub total_chars: usize,
+    /// Pages whose fetch failed. Not serialized here; the CLI prints them.
+    #[serde(skip)]
+    pub failed: Vec<(String, anyhow::Error)>,
 }
 
 #[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
@@ -524,6 +527,19 @@ fn focus_filter(markdown: &str, query: &str, keep: usize) -> String {
     scored.into_iter().map(|(_, _, p)| p).collect::<Vec<_>>().join("\n\n")
 }
 
+/// The text `offset` and `max_chars` index into, and its char count. `focus` applies only when
+/// `content_ok`. A focus miss appends `FOCUS_MISS` to the text but not to the count, so the
+/// hint's "of N" counts page text only.
+fn focus_view(markdown: &str, focus: Option<&str>, content_ok: bool) -> (String, usize) {
+    let Some(q) = focus.filter(|_| content_ok) else {
+        return (markdown.to_string(), markdown.chars().count());
+    };
+    let text = focus_filter(markdown, q, 40);
+    let marker = format!("\n\n{FOCUS_MISS}");
+    let n = text.strip_suffix(marker.as_str()).unwrap_or(text.as_str()).chars().count();
+    (text, n)
+}
+
 /// Cuts `md` to at most `limit` chars (minimum 1, so paging always advances), preferring a
 /// paragraph break. Returns the kept text and whether anything was cut.
 fn truncate(md: &str, limit: usize) -> (String, bool) {
@@ -636,15 +652,16 @@ async fn pdf_text(bytes: Vec<u8>) -> Option<String> {
 }
 
 /// Result for a PDF body: its text layer, or `content_ok: false` when none could be read.
-async fn pdf_result(url: &str, bytes: Vec<u8>, pages: Option<&str>, max_chars: usize, offset: Option<usize>) -> ScrapeResult {
+async fn pdf_result(url: &str, bytes: Vec<u8>, pages: Option<&str>, focus: Option<&str>, max_chars: usize, offset: Option<usize>) -> ScrapeResult {
     let size = bytes.len();
     let text = pdf_text(bytes).await.unwrap_or_default();
     let text = text.trim();
     let total_chars = text.chars().count();
-    let off = offset.unwrap_or(0);
-    let (markdown, truncated) = truncate(&slice_at_offset(text, off), max_chars);
-    let next_offset = truncated.then(|| off + markdown.chars().count());
     let content_ok = total_chars > 20;
+    let (focused, focused_chars) = focus_view(text, focus, content_ok);
+    let off = offset.unwrap_or(0);
+    let (markdown, truncated) = truncate(&slice_at_offset(&focused, off), max_chars);
+    let next_offset = truncated.then(|| off + markdown.chars().count());
     let (note, next_action) = if content_ok {
         (pages.map(|p| format!("pages={p} not applied; whole PDF text returned")), None)
     } else {
@@ -672,22 +689,27 @@ async fn pdf_result(url: &str, bytes: Vec<u8>, pages: Option<&str>, max_chars: u
         headings: vec![],
         next_offset,
         media: vec![],
-        focused_chars: total_chars,
+        focused_chars,
     }
 }
 
-/// Caches and times a PDF result; shared by the `.pdf` path and magic-detected bodies.
+/// Caches (when `content_ok`) and times a PDF result; shared by the `.pdf` path and magic-detected bodies.
+#[allow(clippy::too_many_arguments)]
 async fn pdf_out(
     url: &str,
     key: String,
     bytes: Vec<u8>,
     pages: Option<&str>,
+    focus: Option<&str>,
     max_chars: usize,
     offset: Option<usize>,
     t0: std::time::Instant,
 ) -> (ScrapeResult, Stats) {
-    let pdf = pdf_result(url, bytes, pages, max_chars, offset).await;
-    cache_set(key, pdf.clone());
+    let pdf = pdf_result(url, bytes, pages, focus, max_chars, offset).await;
+    // A failed read (no pdftotext, scanned PDF) is not cached, so it is retried.
+    if pdf.content_ok {
+        cache_set(key, pdf.clone());
+    }
     let ms = t0.elapsed().as_millis();
     let stats = Stats::scrape(&pdf, "miss", 200, ms, ms, 0, 0, 0);
     (pdf, stats)
@@ -810,7 +832,7 @@ async fn run_ext_stats(
     if is_pdf_url(url)
         && let Some(bytes) = fetch_pdf_direct(url).await?
     {
-        return Ok(pdf_out(url, key, bytes, pages, max_chars, offset, t0).await);
+        return Ok(pdf_out(url, key, bytes, pages, focus, max_chars, offset, t0).await);
     }
 
     let t_fetch = std::time::Instant::now();
@@ -830,7 +852,7 @@ async fn run_ext_stats(
             Some(b) => b,
             None => got.html.into_bytes(),
         };
-        return Ok(pdf_out(url, key, bytes, pages, max_chars, offset, t0).await);
+        return Ok(pdf_out(url, key, bytes, pages, focus, max_chars, offset, t0).await);
     }
     let status = got.status;
     let bytes_down = if matches!(got.tier, fetcher::Tier::Http) { got.html.len() } else { 0 };
@@ -880,10 +902,7 @@ async fn run_ext_stats(
     };
 
     let total_chars = doc.markdown.chars().count();
-    let focused = match focus {
-        Some(q) if content_ok => focus_filter(&doc.markdown, q, 40),
-        _ => doc.markdown.clone(),
-    };
+    let (focused, focused_chars) = focus_view(&doc.markdown, focus, content_ok);
     // Paragraphs removed by focus_filter: total minus what survived (both split on "\n\n").
     let dropped_paras = if focus.is_some() && content_ok {
         doc.markdown.split("\n\n").count().saturating_sub(focused.split("\n\n").count())
@@ -891,7 +910,6 @@ async fn run_ext_stats(
         0
     };
     // `offset` indexes the focused text, so the hint needs its length, not the page's.
-    let focused_chars = focused.chars().count();
     let off = offset.unwrap_or(0);
     let (markdown, truncated) = truncate(&slice_at_offset(&focused, off), max_chars);
     let next_offset = truncated.then(|| off + markdown.chars().count());
@@ -930,10 +948,13 @@ async fn run_ext_stats(
         focused_chars,
     };
     let ms_parse = t_parse.elapsed().as_millis();
-    cache_set(key.clone(), out.clone());
-    // also populate legacy key if default options for backwards compat
-    if default_opts {
-        cache_set(cache_key(url, focus, max_chars), out.clone());
+    // Only usable pages are cached; blocked or failed fetches are retried next time.
+    if content_ok {
+        cache_set(key.clone(), out.clone());
+        // also populate legacy key if default options for backwards compat
+        if default_opts {
+            cache_set(cache_key(url, focus, max_chars), out.clone());
+        }
     }
     let ms = t0.elapsed().as_millis();
     let stats = Stats::scrape(&out, "miss", status, ms, ms_fetch, ms_parse, bytes_down, dropped_paras);
@@ -977,9 +998,10 @@ async fn crawl_run(start_url: &str, max_pages: usize, max_depth: usize, focus: O
         if !sitemap_urls.is_empty() {
             if discover_only.unwrap_or(false) {
                 let visited: Vec<String> = sitemap_urls.into_iter().take(max_pages).collect();
-                return Ok(CrawlResult { start_url: start_url.to_string(), pages: vec![], visited, total_chars: 0 });
+                return Ok(CrawlResult { start_url: start_url.to_string(), pages: vec![], visited, total_chars: 0, failed: vec![] });
             }
             let mut pages: Vec<ScrapeResult> = Vec::new();
+            let mut failed: Vec<(String, anyhow::Error)> = Vec::new();
             let mut visited: HashSet<String> = HashSet::new();
             let mut total_chars = 0usize;
             for url in sitemap_urls.into_iter().take(max_pages) {
@@ -990,7 +1012,10 @@ async fn crawl_run(start_url: &str, max_pages: usize, max_depth: usize, focus: O
                 if pages.len() >= max_pages { break; }
                 let doc = match run(&url, focus, max_chars, true).await {
                     Ok(d) => d,
-                    Err(_) => continue,
+                    Err(e) => {
+                        failed.push((url, e));
+                        continue;
+                    }
                 };
                 total_chars += doc.markdown.chars().count();
                 let exceed = max_total_chars.map(|l| total_chars > l).unwrap_or(false);
@@ -998,7 +1023,7 @@ async fn crawl_run(start_url: &str, max_pages: usize, max_depth: usize, focus: O
                 if exceed { break; }
             }
             let visited_list: Vec<String> = visited.into_iter().collect();
-            return Ok(CrawlResult { start_url: start_url.to_string(), pages, visited: visited_list, total_chars });
+            return Ok(CrawlResult { start_url: start_url.to_string(), pages, visited: visited_list, total_chars, failed });
         }
     }
     if discover_only.unwrap_or(false) {
@@ -1037,13 +1062,14 @@ async fn crawl_run(start_url: &str, max_pages: usize, max_depth: usize, focus: O
             }
         }
         let visited_list: Vec<String> = visited.into_iter().collect();
-        return Ok(CrawlResult { start_url: start_url.to_string(), pages: vec![], visited: visited_list, total_chars: 0 });
+        return Ok(CrawlResult { start_url: start_url.to_string(), pages: vec![], visited: visited_list, total_chars: 0, failed: vec![] });
     }
     // BFS one level at a time, 4 fetches in flight. `visited` lists only pages actually
     // fetched; `queued` stops a URL from being scheduled twice.
     let mut queued: HashSet<String> = HashSet::from([normalize_url(start_url)]);
     let mut visited: Vec<String> = Vec::new();
     let mut pages: Vec<ScrapeResult> = Vec::new();
+    let mut failed: Vec<(String, anyhow::Error)> = Vec::new();
     let mut total_chars = 0usize;
     let mut frontier = vec![start_url.to_string()];
     let mut depth = 0usize;
@@ -1056,7 +1082,13 @@ async fn crawl_run(start_url: &str, max_pages: usize, max_depth: usize, focus: O
                 break 'bfs;
             }
             for (url, res) in fetch_all(chunk.to_vec(), focus.map(str::to_string), max_chars, 4, "crawl_page").await {
-                let Ok((doc, _)) = res else { continue };
+                let doc = match res {
+                    Ok((doc, _)) => doc,
+                    Err(e) => {
+                        failed.push((url, e));
+                        continue;
+                    }
+                };
                 visited.push(url);
                 total_chars += doc.markdown.chars().count();
                 let exceed = max_total_chars.is_some_and(|l| total_chars > l);
@@ -1099,7 +1131,7 @@ async fn crawl_run(start_url: &str, max_pages: usize, max_depth: usize, focus: O
         frontier = next;
         depth += 1;
     }
-    Ok(CrawlResult { start_url: start_url.to_string(), pages, visited, total_chars })
+    Ok(CrawlResult { start_url: start_url.to_string(), pages, visited, total_chars, failed })
 }
 
 fn normalize_url(u: &str) -> String {
@@ -1201,12 +1233,6 @@ fn sh_single(s: &str) -> String {
     format!("'{}'", s.replace('\'', "'\\''"))
 }
 
-/// Double-quoted shell word; escapes `\`, `"`, `$` and backtick.
-fn sh_double(s: &str) -> String {
-    let esc = s.replace('\\', "\\\\").replace('"', "\\\"").replace('$', "\\$").replace('`', "\\`");
-    format!("\"{esc}\"")
-}
-
 /// Markdown body plus, when truncated, a paste-able command for the rest. The command repeats
 /// the focus and max-chars that produced `next_offset`, so the offset lines up with the same text.
 fn with_hint(markdown: &str, url: &str, next_offset: Option<usize>, focused_chars: usize, focus: Option<&str>, max_chars: usize) -> String {
@@ -1215,7 +1241,7 @@ fn with_hint(markdown: &str, url: &str, next_offset: Option<usize>, focused_char
     };
     let mut cmd = format!("scour scrape {} --offset {n} --max-chars {max_chars}", sh_single(url));
     if let Some(f) = focus {
-        cmd += &format!(" --focus {}", sh_double(f));
+        cmd += &format!(" --focus {}", sh_single(f));
     }
     // focused_chars is 0 for results cached before the field existed.
     let of = if focused_chars > 0 { format!(" of {focused_chars}") } else { String::new() };
@@ -1322,8 +1348,13 @@ fn parse_scrape(args: &[String]) -> Result<ScrapeOpts, String> {
         return Err("missing <url>".into());
     }
     o.url = words.remove(0);
+    // Positional focus words and --focus merge into one query.
     if !words.is_empty() {
-        o.focus = Some(words.join(" "));
+        let rest = words.join(" ");
+        o.focus = Some(match o.focus.take() {
+            Some(f) => format!("{f} {rest}"),
+            None => rest,
+        });
     }
     Ok(o)
 }
@@ -1435,7 +1466,7 @@ fn parse_links(args: &[String]) -> Result<LinksOpts, String> {
         match args[i].as_str() {
             "--filter" => filter = Some(flag_value(args, &mut i)?.to_string()),
             "--same-site" => same_site = true,
-            "--max" => max = parse_num(flag_value(args, &mut i)?, "--max")?,
+            "--max" => max = parse_pos(flag_value(args, &mut i)?, "--max")?,
             s if s.starts_with('-') => return Err(format!("unknown flag {s}")),
             s => words.push(s.to_string()),
         }
@@ -1623,11 +1654,16 @@ fn fetched_md(r: &ScrapeResult, focus: Option<&str>, max_chars: usize) -> String
     )
 }
 
+/// Markdown section for a failed fetch (`## url`, error comment).
+fn print_failed(url: &str, e: &anyhow::Error) {
+    println!("## {url}\n<!-- error: {e} -->\n\n_fetch failed_\n");
+}
+
 fn print_pages_md(pages: &[PageFetch], focus: Option<&str>, max_chars: usize) {
     for (url, res) in pages {
         match res {
             Ok((r, _)) => println!("{}\n", fetched_md(r, focus, max_chars)),
-            Err(e) => println!("## {url}\n<!-- error: {e} -->\n\n_fetch failed_\n"),
+            Err(e) => print_failed(url, e),
         }
     }
 }
@@ -1771,12 +1807,23 @@ async fn cmd_gh(args: &[String]) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Registry names `tools::pkg` accepts (case-insensitive, surrounding spaces ignored).
+fn is_pkg_registry(r: &str) -> bool {
+    matches!(
+        r.trim().to_ascii_lowercase().as_str(),
+        "crates" | "crate" | "crates.io" | "npm" | "npmjs" | "pypi" | "pip"
+    )
+}
+
 async fn cmd_pkg(args: &[String]) -> anyhow::Result<()> {
     let mut words = positionals(args).unwrap_or_else(|e| usage(&e));
     if words.len() < 2 {
         usage("pkg needs a registry (crates|npm|pypi) and at least one name");
     }
     let registry = words.remove(0);
+    if !is_pkg_registry(&registry) {
+        usage(&format!("unknown registry '{registry}' (valid: crates, npm, pypi)"));
+    }
     let names = cap_inputs(words, "pkg");
     let res = futures::future::join_all(names.iter().map(|n| tools::pkg(&registry, n))).await;
     if print_lookups(&names, res) > 0 {
@@ -1803,10 +1850,17 @@ async fn cmd_crawl(args: &[String]) -> anyhow::Result<()> {
     let t0 = std::time::Instant::now();
     let res = crawl_run(&o.url, o.max_pages, o.depth, o.focus.as_deref(), o.max_chars, Some(o.sitemap), None, None).await?;
     if o.json {
-        println!("{}", serde_json::to_string(&res)?);
+        let mut v = serde_json::to_value(&res)?;
+        if let Some(items) = v["pages"].as_array_mut() {
+            items.extend(res.failed.iter().map(|(u, e)| error_json(u, e)));
+        }
+        println!("{v}");
     } else {
         for p in &res.pages {
             println!("{}\n", fetched_md(p, o.focus.as_deref(), o.max_chars));
+        }
+        for (url, e) in &res.failed {
+            print_failed(url, e);
         }
     }
     if o.stats {
@@ -1928,13 +1982,30 @@ mod cli_tests {
         assert_eq!(with_hint("abc", "https://e.com/a", None, 0, None, 300), "abc");
         assert_eq!(
             with_hint("abc", "https://e.com/a", Some(150), 900, Some("rust traits"), 300),
-            "abc\n\n<!-- truncated at 150 of 900 chars; more: scour scrape 'https://e.com/a' --offset 150 --max-chars 300 --focus \"rust traits\" -->"
+            "abc\n\n<!-- truncated at 150 of 900 chars; more: scour scrape 'https://e.com/a' --offset 150 --max-chars 300 --focus 'rust traits' -->"
         );
         assert_eq!(
             with_hint("x", "https://e.com/it's", Some(5), 9, None, 6000),
             "x\n\n<!-- truncated at 5 of 9 chars; more: scour scrape 'https://e.com/it'\\''s' --offset 5 --max-chars 6000 -->"
         );
-        assert_eq!(sh_double(r#"a "b" $c `d` \e"#), r#""a \"b\" \$c \`d\` \\e""#);
+        assert_eq!(sh_single("a \"b\" $c `d` !e"), "'a \"b\" $c `d` !e'");
+        assert!(with_hint("x", "https://e.com", Some(1), 2, Some("hi!"), 9).contains("--focus 'hi!'"));
+    }
+
+    #[test]
+    fn focus_merges_flag_and_words() {
+        let o = parse_scrape(&s(&["https://e.com", "traits", "--focus", "rust"])).unwrap();
+        assert_eq!(o.focus.as_deref(), Some("rust traits"));
+        let o = parse_scrape(&s(&["https://e.com", "--focus", "rust", "traits"])).unwrap();
+        assert_eq!(o.focus.as_deref(), Some("rust traits"));
+    }
+
+    #[test]
+    fn links_and_pkg_usage_errors() {
+        assert!(parse_links(&s(&["https://e.com", "--max", "0"])).is_err());
+        assert_eq!(parse_links(&s(&["https://e.com", "--max", "3"])).unwrap().max, 3);
+        assert!(is_pkg_registry("NPM") && is_pkg_registry(" pip ") && is_pkg_registry("crates.io"));
+        assert!(!is_pkg_registry("maven"));
     }
 
     #[test]
@@ -2019,6 +2090,19 @@ mod tests {
         assert!(!out.contains("unrelated filler"));
         assert!(out.find("yarn").unwrap() < out.find("sleeping").unwrap());
         assert_eq!(super::focus_filter(md, "zebra", 40), format!("{md}\n\n{}", super::FOCUS_MISS));
+    }
+
+    #[test]
+    fn focus_view_counts_page_text_not_marker() {
+        let md = "about cats\n\nunrelated filler";
+        let (text, n) = super::focus_view(md, Some("cats"), true);
+        assert!(!text.contains("unrelated"));
+        assert_eq!(n, text.chars().count());
+        let (miss, n) = super::focus_view(md, Some("zebra"), true);
+        assert!(miss.ends_with(super::FOCUS_MISS));
+        assert_eq!(n, md.chars().count());
+        // Focus is ignored for unusable content (no marker either).
+        assert_eq!(super::focus_view(md, Some("cats"), false), (md.to_string(), md.chars().count()));
     }
 
     #[test]
