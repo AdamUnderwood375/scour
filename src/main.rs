@@ -227,6 +227,9 @@ pub struct SearchResult {
     pub query: String,
     pub hits: Vec<SearchHit>,
     pub total: usize,
+    /// Per-engine status, e.g. ["ddg:ok:10","bing:ok:9","brave:blocked:captcha","mojeek:timeout"].
+    #[serde(default)]
+    pub engines: Vec<String>,
 }
 
 // ── MCP Server ──────────────────────────────────────────────────────────────
