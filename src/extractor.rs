@@ -314,7 +314,7 @@ mod tests {
     #[test]
     fn short_article_not_misclassified_as_list() {
         let html = r#"<html><head><title>Example Domain</title></head><body><h1>Example Domain</h1><p>This domain is for use in documentation examples without needing permission. Avoid use in operations.</p><p><a href="https://iana.org/domains/example">Learn more</a></p></body></html>"#;
-        let d = super::extract(&html, "https://example.com").unwrap();
+        let d = super::extract(html, "https://example.com").unwrap();
         assert_eq!(d.page_type, "article");
         assert!(d.title.contains("Example Domain") || d.markdown.contains("Example Domain"));
         assert!(d.markdown.contains("This domain"));

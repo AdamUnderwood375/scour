@@ -366,13 +366,7 @@ impl Scour {
 
     #[tool(description = "Version and build info.")]
     async fn scour_version(&self) -> Result<Json<serde_json::Value>, ErrorData> {
-        Ok(Json(serde_json::json!({
-            "name": "scour",
-            "version": env!("CARGO_PKG_VERSION"),
-            "tools": ["scrape", "scrape_batch", "crawl", "search", "screenshot", "cache_clear", "scour_version"],
-            "features": ["http+chrome ladder", "readability+fallback", "bm25 focus", "parallel batch", "in-domain crawl", "links+page_type", "1hr cache", "keyless search", "screenshot", "offset pagination", "include_media", "actions", "pdf pages"],
-            "browser": std::env::var("SCOUR_BROWSER").unwrap_or("/usr/bin/brave".to_string())
-        })))
+        Ok(Json(version_info()))
     }
 }
 
@@ -385,6 +379,75 @@ impl ServerHandler for Scour {
 }
 
 // ── Helpers ─────────────────────────────────────────────────────────────────
+
+fn version_info() -> serde_json::Value {
+    serde_json::json!({
+        "name": "scour",
+        "version": env!("CARGO_PKG_VERSION"),
+        "tools": ["scrape", "scrape_batch", "crawl", "search", "screenshot", "cache_clear", "scour_version"],
+        "features": ["http+chrome ladder", "readability+fallback", "bm25 focus", "parallel batch", "in-domain crawl", "links+page_type", "1hr cache", "keyless search", "screenshot", "offset pagination", "include_media", "actions", "pdf pages"],
+        "browser": std::env::var("SCOUR_BROWSER").unwrap_or("/usr/bin/brave".to_string())
+    })
+}
+
+/// One stats line per fetch, emitted to stderr as `stats: {json}` under `--stats`.
+#[derive(serde::Serialize)]
+struct Stats {
+    op: &'static str,
+    url: String,
+    tier: String,
+    status: u16,
+    cache: &'static str,
+    ms: u128,
+    ms_fetch: u128,
+    ms_parse: u128,
+    bytes_down: usize,
+    chars_out: usize,
+    est_tokens: usize,
+    truncated: bool,
+    dropped_paras: usize,
+    quality: f32,
+    page_type: String,
+}
+
+impl Stats {
+    #[allow(clippy::too_many_arguments)]
+    fn scrape(
+        r: &ScrapeResult,
+        cache: &'static str,
+        status: u16,
+        ms: u128,
+        ms_fetch: u128,
+        ms_parse: u128,
+        bytes_down: usize,
+        dropped_paras: usize,
+    ) -> Stats {
+        let chars_out = r.markdown.len();
+        Stats {
+            op: "scrape",
+            url: r.url.clone(),
+            tier: r.tier.clone(),
+            status,
+            cache,
+            ms,
+            ms_fetch,
+            ms_parse,
+            bytes_down,
+            chars_out,
+            est_tokens: chars_out / 4,
+            truncated: r.truncated,
+            dropped_paras,
+            quality: r.quality_score,
+            page_type: r.page_type.clone(),
+        }
+    }
+
+    fn print(&self) {
+        if let Ok(s) = serde_json::to_string(self) {
+            eprintln!("stats: {s}");
+        }
+    }
+}
 
 fn validate(url: &str) -> anyhow::Result<()> {
     let u = url::Url::parse(url)?;
@@ -669,6 +732,24 @@ async fn run_ext(
     pages: Option<&str>,
     actions: Option<&[Action]>,
 ) -> anyhow::Result<ScrapeResult> {
+    Ok(run_ext_stats(url, focus, max_chars, include_links, offset, include_media, pages, actions)
+        .await?
+        .0)
+}
+
+// Same as `run_ext` but also returns timing/size stats for the `--stats` CLI flag.
+#[allow(clippy::too_many_arguments)]
+async fn run_ext_stats(
+    url: &str,
+    focus: Option<&str>,
+    max_chars: usize,
+    include_links: bool,
+    offset: Option<usize>,
+    include_media: bool,
+    pages: Option<&str>,
+    actions: Option<&[Action]>,
+) -> anyhow::Result<(ScrapeResult, Stats)> {
+    let t0 = std::time::Instant::now();
     validate(url)?;
     // PDF early path
     if let Some(pdf) = try_pdf_fetch(url, pages, max_chars, offset).await? {
@@ -677,7 +758,9 @@ async fn run_ext(
         let key = cache_key_ext(url, focus, max_chars, offset, include_media, pages, actions.map(|a| a.len()).unwrap_or(0));
         // don't cache failed pdf previews? cache anyway
         cache_set(key, pdf.clone());
-        return Ok(pdf);
+        let ms = t0.elapsed().as_millis();
+        let stats = Stats::scrape(&pdf, "miss", 200, ms, ms, 0, 0, 0);
+        return Ok((pdf, stats));
     }
 
     let actions_len = actions.map(|a| a.len()).unwrap_or(0);
@@ -685,15 +768,20 @@ async fn run_ext(
     let key = cache_key_ext(url, focus, max_chars, offset, include_media, pages, actions_len);
     // but also check legacy key for backwards compat when offset etc are default
     if let Some(cached) = cache_get(&key) {
-        return Ok(cached);
+        let ms = t0.elapsed().as_millis();
+        let stats = Stats::scrape(&cached, "hit", 200, ms, 0, 0, 0, 0);
+        return Ok((cached, stats));
     }
     if offset.is_none() && !include_media && pages.is_none() && actions_len == 0 {
         let legacy = cache_key(url, focus, max_chars);
         if let Some(cached) = cache_get(&legacy) {
-            return Ok(cached);
+            let ms = t0.elapsed().as_millis();
+            let stats = Stats::scrape(&cached, "hit", 200, ms, 0, 0, 0, 0);
+            return Ok((cached, stats));
         }
     }
 
+    let t_fetch = std::time::Instant::now();
     let got = if let Some(acts) = actions {
         if !acts.is_empty() {
             fetch_chrome_with_actions(url, acts).await?
@@ -703,7 +791,11 @@ async fn run_ext(
     } else {
         fetcher::fetch(url).await?
     };
+    let ms_fetch = t_fetch.elapsed().as_millis();
+    let status = got.status;
+    let bytes_down = if matches!(got.tier, fetcher::Tier::Http) { got.html.len() } else { 0 };
 
+    let t_parse = std::time::Instant::now();
     let tier = format!("{:?}", got.tier).to_lowercase();
     let doc = extractor::extract(&got.html, url).unwrap_or(extractor::CleanDoc {
         title: String::new(),
@@ -752,6 +844,12 @@ async fn run_ext(
         Some(q) if content_ok => focus_filter(&doc.markdown, q, 40),
         _ => doc.markdown.clone(),
     };
+    // Paragraphs removed by focus_filter: total minus what survived (both split on "\n\n").
+    let dropped_paras = if focus.is_some() && content_ok {
+        doc.markdown.split("\n\n").count().saturating_sub(focused.split("\n\n").count())
+    } else {
+        0
+    };
     let sliced = slice_at_offset(&focused, offset.unwrap_or(0));
     let (markdown, truncated) = truncate(&sliced, max_chars);
     let next_offset = if truncated {
@@ -792,12 +890,15 @@ async fn run_ext(
         next_offset,
         media,
     };
+    let ms_parse = t_parse.elapsed().as_millis();
     cache_set(key.clone(), out.clone());
     // also populate legacy key if default options for backwards compat
     if offset.is_none() && !include_media && pages.is_none() && actions_len == 0 {
         cache_set(cache_key(url, focus, max_chars), out.clone());
     }
-    Ok(out)
+    let ms = t0.elapsed().as_millis();
+    let stats = Stats::scrape(&out, "miss", status, ms, ms_fetch, ms_parse, bytes_down, dropped_paras);
+    Ok((out, stats))
 }
 
 async fn fetch_sitemap_urls(domain: &str) -> Vec<String> {
@@ -1207,19 +1308,181 @@ async fn screenshot_run(url: &str) -> anyhow::Result<String> {
     Ok(if b64.len() > 20000 { format!("{}...[truncated {} bytes]", &b64[..20000], png.len()) } else { b64 })
 }
 
+fn usage() -> ! {
+    eprintln!(
+        "usage:\n  \
+         scour <url> [focus...]                 scrape (shim)\n  \
+         scour scrape <url> [focus...] [--max-chars N] [--stats]\n  \
+         scour search <query...> [--max N] [--site DOMAIN] [--freshness day|week|month|year] [--stats]\n  \
+         scour batch [urls...] [--focus \"...\"] [--max-chars N] [--parallel N] [--stats]  (urls from stdin if omitted)\n  \
+         scour cache-clear\n  \
+         scour --version | -V\n  \
+         scour                                   MCP stdio server"
+    );
+    std::process::exit(2);
+}
+
+// Shared markdown emitter for the shim and the `scrape` subcommand.
+fn emit_scrape(r: &ScrapeResult) {
+    if let Some(n) = &r.note { eprintln!("warning: {n}"); }
+    if let Some(a) = &r.next_action { eprintln!("next: {a}"); }
+    eprintln!("page_type: {} quality: {:.2} links: {} headings: {} next_offset: {:?} media: {}", r.page_type, r.quality_score, r.links.len(), r.headings.len(), r.next_offset, r.media.len());
+    println!("# {}\n<!-- tier: {} content_ok: {} chars: {} -->\n\n{}", r.title, r.tier, r.content_ok, r.total_chars, r.markdown);
+}
+
+async fn cmd_scrape(args: &[String]) -> anyhow::Result<()> {
+    let mut url: Option<String> = None;
+    let mut focus_words: Vec<String> = Vec::new();
+    let mut max_chars = 40_000usize;
+    let mut stats = false;
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--max-chars" => { i += 1; max_chars = args.get(i).and_then(|s| s.parse().ok()).unwrap_or(40_000); }
+            "--stats" => stats = true,
+            s if s.starts_with("--") => usage(),
+            s => { if url.is_none() { url = Some(s.to_string()); } else { focus_words.push(s.to_string()); } }
+        }
+        i += 1;
+    }
+    let url = match url { Some(u) => u, None => usage() };
+    let focus = (!focus_words.is_empty()).then(|| focus_words.join(" "));
+    let (r, st) = run_ext_stats(&url, focus.as_deref(), max_chars, true, None, false, None, None).await?;
+    emit_scrape(&r);
+    if stats { st.print(); }
+    Ok(())
+}
+
+async fn cmd_search(args: &[String]) -> anyhow::Result<()> {
+    let mut query_words: Vec<String> = Vec::new();
+    let mut max = 10usize;
+    let mut site: Option<String> = None;
+    let mut freshness: Option<String> = None;
+    let mut stats = false;
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--max" => { i += 1; max = args.get(i).and_then(|s| s.parse().ok()).unwrap_or(10); }
+            "--site" => { i += 1; site = args.get(i).cloned(); }
+            "--freshness" => { i += 1; freshness = args.get(i).cloned(); }
+            "--stats" => stats = true,
+            s if s.starts_with("--") => usage(),
+            s => query_words.push(s.to_string()),
+        }
+        i += 1;
+    }
+    let query = query_words.join(" ");
+    if query.is_empty() { usage(); }
+    let t0 = std::time::Instant::now();
+    let hits = search_run(&query, max.clamp(1, 20), site.as_deref(), None, freshness.as_deref()).await?;
+    let ms = t0.elapsed().as_millis();
+    println!("# {query}");
+    for (idx, h) in hits.iter().enumerate() {
+        println!("{}. {} — {}", idx + 1, h.title, h.url);
+        if !h.snippet.is_empty() { println!("   {}", h.snippet); }
+    }
+    if stats {
+        eprintln!("stats: {}", serde_json::json!({"op":"search","query":query,"hits":hits.len(),"ms":ms}));
+    }
+    Ok(())
+}
+
+async fn cmd_batch(args: &[String]) -> anyhow::Result<()> {
+    let mut urls: Vec<String> = Vec::new();
+    let mut focus: Option<String> = None;
+    let mut max_chars = 40_000usize;
+    let mut parallel = 4usize;
+    let mut stats = false;
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--focus" => { i += 1; focus = args.get(i).cloned(); }
+            "--max-chars" => { i += 1; max_chars = args.get(i).and_then(|s| s.parse().ok()).unwrap_or(40_000); }
+            "--parallel" => { i += 1; parallel = args.get(i).and_then(|s| s.parse().ok()).unwrap_or(4); }
+            "--stats" => stats = true,
+            s if s.starts_with("--") => usage(),
+            s => urls.push(s.to_string()),
+        }
+        i += 1;
+    }
+    if urls.is_empty() {
+        use std::io::Read;
+        let mut buf = String::new();
+        std::io::stdin().read_to_string(&mut buf)?;
+        urls = buf.split_whitespace().map(|s| s.to_string()).collect();
+    }
+    urls.truncate(20);
+    if urls.is_empty() { usage(); }
+    let parallel = parallel.clamp(1, 8);
+    let n = urls.len();
+
+    let t0 = std::time::Instant::now();
+    let sem = std::sync::Arc::new(tokio::sync::Semaphore::new(parallel));
+    let mut set = tokio::task::JoinSet::new();
+    for (idx, url) in urls.into_iter().enumerate() {
+        let sem = sem.clone();
+        let focus = focus.clone();
+        set.spawn(async move {
+            let _permit = sem.acquire_owned().await;
+            let res = run_ext_stats(&url, focus.as_deref(), max_chars, true, None, false, None, None).await;
+            (idx, url, res)
+        });
+    }
+    type BatchSlot = Option<(String, anyhow::Result<(ScrapeResult, Stats)>)>;
+    let mut slots: Vec<BatchSlot> = (0..n).map(|_| None).collect();
+    while let Some(joined) = set.join_next().await {
+        if let Ok((idx, url, res)) = joined {
+            slots[idx] = Some((url, res));
+        }
+    }
+
+    let mut total_chars = 0usize;
+    let mut ok = 0usize;
+    for slot in slots {
+        let Some((url, res)) = slot else { continue; };
+        match res {
+            Ok((r, mut st)) => {
+                println!("## {}\n<!-- tier: {} content_ok: {} chars: {} -->\n\n{}", url, r.tier, r.content_ok, r.total_chars, r.markdown);
+                total_chars += r.markdown.len();
+                if r.content_ok { ok += 1; }
+                if stats { st.op = "batch_item"; st.print(); }
+            }
+            Err(e) => {
+                println!("## {}\n<!-- tier: error content_ok: false chars: 0 -->\n\n_fetch failed: {e}_", url);
+            }
+        }
+    }
+    if stats {
+        eprintln!("stats: {}", serde_json::json!({"op":"batch","n":n,"ms":t0.elapsed().as_millis(),"chars_out":total_chars,"est_tokens":total_chars/4,"ok":ok}));
+    }
+    Ok(())
+}
+
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    if let Some(url) = std::env::args().nth(1) {
-        let focus = {
-            let rest: Vec<String> = std::env::args().skip(2).collect();
-            (!rest.is_empty()).then(|| rest.join(" "))
-        };
-        let r = run(&url, focus.as_deref(), 40_000, true).await?;
-        if let Some(n) = &r.note { eprintln!("warning: {n}"); }
-        if let Some(a) = &r.next_action { eprintln!("next: {a}"); }
-        eprintln!("page_type: {} quality: {:.2} links: {} headings: {} next_offset: {:?} media: {}", r.page_type, r.quality_score, r.links.len(), r.headings.len(), r.next_offset, r.media.len());
-        println!("# {}\n<!-- tier: {} content_ok: {} chars: {} -->\n\n{}", r.title, r.tier, r.content_ok, r.total_chars, r.markdown);
-        return Ok(());
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    match args.first().map(|s| s.as_str()) {
+        Some("--version" | "-V") => {
+            println!("{}", serde_json::to_string(&version_info()).unwrap_or_default());
+            return Ok(());
+        }
+        Some("scrape") => return cmd_scrape(&args[1..]).await,
+        Some("search") => return cmd_search(&args[1..]).await,
+        Some("batch") => return cmd_batch(&args[1..]).await,
+        Some("cache-clear") => {
+            cache::cache_clear();
+            eprintln!("cache cleared");
+            return Ok(());
+        }
+        // Unknown first token: back-compat shim — treat args as `<url> [focus...]`.
+        Some(_) => {
+            let url = &args[0];
+            let focus = (args.len() > 1).then(|| args[1..].join(" "));
+            let r = run(url, focus.as_deref(), 40_000, true).await?;
+            emit_scrape(&r);
+            return Ok(());
+        }
+        None => {}
     }
     use rmcp::ServiceExt;
     let service = Scour::new().serve(rmcp::transport::stdio()).await?;
