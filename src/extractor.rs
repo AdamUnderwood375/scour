@@ -47,7 +47,8 @@ fn visible_text_len(html: &str) -> usize {
     let mut len = 0;
     let mut in_tag = false;
     let mut in_script = false;
-    let lower = html.to_lowercase();
+    // ASCII-only lowercase keeps byte offsets aligned with `html`.
+    let lower = html.to_ascii_lowercase();
     // crude but fast: count non-tag, non-script chars
     let mut i = 0;
     let b = html.as_bytes();
@@ -113,7 +114,7 @@ fn extract_links(html: &str, base_url: &str) -> Vec<Link> {
             continue;
         }
         // Cap at 100 chars for text
-        let text = if text.len() > 100 { text[..100].to_string() } else { text };
+        let text = take_chars(&text, 100).to_string();
         links.push(Link { href: abs, text });
         if links.len() >= 100 {
             break;
@@ -127,6 +128,75 @@ fn extract_meta(html: &str) -> (Option<String>, Option<String>) {
     let title = doc.select(title_sel()).next().map(|e| e.text().collect::<String>().trim().to_string()).filter(|s| !s.is_empty());
     let desc = doc.select(meta_desc_sel()).next().and_then(|e| e.value().attr("content")).map(|s| s.trim().to_string()).filter(|s| !s.is_empty());
     (title, desc)
+}
+
+/// First `n` chars of `s`. Never splits a UTF-8 code point.
+fn take_chars(s: &str, n: usize) -> &str {
+    match s.char_indices().nth(n) {
+        Some((i, _)) => &s[..i],
+        None => s,
+    }
+}
+
+/// Cleanup for html2md output. Single pass, O(n):
+/// - runs of 3+ spaces/tabs inside a line collapse to one space (leading indent kept)
+/// - lines made only of `|`, `-`, `:` are dropped, except a `|---|` separator right after a text line
+/// - 3+ consecutive blank lines collapse to one blank line; leading/trailing blanks are dropped
+pub fn clean_markdown(md: &str) -> String {
+    let mut out = String::with_capacity(md.len());
+    let mut blanks = 0usize; // pending blank lines, not yet written
+    let mut prev_text = false; // previous input line had alphanumerics
+    for line in md.lines() {
+        let t = line.trim();
+        if t.is_empty() {
+            blanks += 1;
+            prev_text = false;
+            continue;
+        }
+        let has_text = t.chars().any(char::is_alphanumeric);
+        let rule_like = t.chars().all(|c| c.is_whitespace() || matches!(c, '|' | '-' | ':'));
+        let separator_after_text = prev_text && t.contains('|') && t.contains('-');
+        prev_text = has_text;
+        if rule_like && !separator_after_text {
+            continue;
+        }
+        if !out.is_empty() {
+            let n = if blanks >= 3 { 1 } else { blanks };
+            out.push_str(&"\n".repeat(n));
+        }
+        blanks = 0;
+        let indent = line.len() - line.trim_start().len();
+        out.push_str(&line[..indent]);
+        collapse_space_runs(&line[indent..], &mut out);
+        out.push('\n');
+    }
+    if out.ends_with('\n') {
+        out.pop();
+    }
+    out
+}
+
+/// Append `s` to `out`, replacing each run of 3+ spaces/tabs with one space.
+/// Slices only at ASCII boundaries, so it is UTF-8 safe.
+fn collapse_space_runs(s: &str, out: &mut String) {
+    let b = s.as_bytes();
+    let (mut i, mut last) = (0, 0);
+    while i < b.len() {
+        if b[i] == b' ' || b[i] == b'\t' {
+            let start = i;
+            while i < b.len() && (b[i] == b' ' || b[i] == b'\t') {
+                i += 1;
+            }
+            if i - start > 2 {
+                out.push_str(&s[last..start]);
+                out.push(' ');
+                last = i;
+            }
+        } else {
+            i += 1;
+        }
+    }
+    out.push_str(&s[last..]);
 }
 
 fn is_table_artifact(md: &str) -> bool {
@@ -146,11 +216,7 @@ fn generate_link_markdown(title: &str, links: &[Link], html: &str) -> String {
         .map(|b| b.text().collect::<Vec<_>>().join(" "))
         .unwrap_or_default();
     let body_text: String = body_text.split_whitespace().collect::<Vec<_>>().join(" ");
-    let body_snippet = if body_text.len() > 2000 {
-        body_text[..2000].to_string()
-    } else {
-        body_text
-    };
+    let body_snippet = take_chars(&body_text, 2000);
     // Deduplicate links by href, keep order
     let mut seen = std::collections::HashSet::new();
     let mut unique: Vec<&Link> = Vec::new();
@@ -260,6 +326,9 @@ pub fn extract(html: &str, url: &str) -> Result<CleanDoc> {
         text = markdown.clone();
     }
 
+    markdown = clean_markdown(&markdown);
+    text = clean_markdown(&text);
+
     let (_, description) = extract_meta(html);
     let ptype = page_type(&markdown, &links, text.trim().len(), html.len());
     let q = quality_score(text.trim().len(), html.len(), links.len(), title.len());
@@ -318,5 +387,54 @@ mod tests {
         assert_eq!(d.page_type, "article");
         assert!(d.title.contains("Example Domain") || d.markdown.contains("Example Domain"));
         assert!(d.markdown.contains("This domain"));
+    }
+
+    #[test]
+    fn truncates_multibyte_text_by_chars() {
+        let long_cjk = "日本語".repeat(100); // 300 chars, 900 bytes
+        assert_eq!(super::take_chars(&long_cjk, 100).chars().count(), 100);
+        assert_eq!(super::take_chars("短い", 100), "短い");
+        let html = format!(r#"<a href="https://example.com/x">{long_cjk}</a>"#);
+        let links = super::extract_links(&html, "https://example.com");
+        assert_eq!(links[0].text.chars().count(), 100);
+        let body = format!("<html><body>{}</body></html>", "中文テキスト ".repeat(500));
+        let md = super::generate_link_markdown("T", &[], &body);
+        assert!(md.chars().count() < 2100, "snippet not capped: {}", md.chars().count());
+    }
+
+    #[test]
+    fn visible_text_len_survives_length_changing_lowercase() {
+        // U+212A KELVIN SIGN lowercases to 'k' (3 bytes -> 1 byte) and used to misalign offsets.
+        let html = format!("{}<SCRIPT>x</SCRIPT>visible", "\u{212A}".repeat(50));
+        assert!(super::visible_text_len(&html) >= 50 + 7);
+    }
+
+    #[test]
+    fn clean_markdown_collapses_space_runs() {
+        assert_eq!(super::clean_markdown("a      b"), "a b");
+        assert_eq!(super::clean_markdown("a  b"), "a  b");
+        assert_eq!(super::clean_markdown("- x\n    - y"), "- x\n    - y");
+        let huge = format!("x{}y", " ".repeat(1_000_000));
+        assert_eq!(super::clean_markdown(&huge), "x y");
+    }
+
+    #[test]
+    fn clean_markdown_drops_rule_junk_but_keeps_tables() {
+        assert_eq!(super::clean_markdown("text\n|  |  |\nmore"), "text\nmore");
+        assert_eq!(super::clean_markdown("|---|---|\nafter"), "after");
+        let table = "| a | b |\n|---|:--:|\n| 1 | 2 |";
+        assert_eq!(super::clean_markdown(table), table);
+    }
+
+    #[test]
+    fn clean_markdown_collapses_blank_runs() {
+        assert_eq!(super::clean_markdown("a\n\n\n\nb"), "a\n\nb");
+        assert_eq!(super::clean_markdown("\n\na\n\n"), "a");
+    }
+
+    #[test]
+    fn clean_markdown_is_utf8_safe() {
+        let md = "日本語   テキスト\n\n\n\n|---|\n中文 ✓   ok";
+        assert_eq!(super::clean_markdown(md), "日本語 テキスト\n\n中文 ✓ ok");
     }
 }
