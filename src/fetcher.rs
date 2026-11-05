@@ -278,6 +278,21 @@ async fn fetch_http(url: &str) -> Result<Fetched> {
 
 /// Reuse the browser already on this machine instead of downloading another.
 /// Brave is Chromium-based, so it speaks the same DevTools protocol.
+/// Newest Playwright-managed Chromium (`~/.cache/ms-playwright/chromium-*/chrome-linux*/chrome`).
+fn playwright_chromium() -> Option<std::path::PathBuf> {
+    let root = std::path::PathBuf::from(std::env::var_os("HOME")?).join(".cache/ms-playwright");
+    let mut dirs: Vec<_> = std::fs::read_dir(&root)
+        .ok()?
+        .flatten()
+        .map(|e| e.path())
+        .filter(|p| p.file_name().and_then(|n| n.to_str()).is_some_and(|n| n.starts_with("chromium-")))
+        .collect();
+    dirs.sort();
+    dirs.iter().rev().find_map(|d| {
+        ["chrome-linux64/chrome", "chrome-linux/chrome"].iter().map(|s| d.join(s)).find(|p| p.exists())
+    })
+}
+
 fn browser_path() -> Result<std::path::PathBuf> {
     if let Ok(p) = std::env::var("SCOUR_BROWSER") {
         return Ok(p.into());
@@ -293,6 +308,7 @@ fn browser_path() -> Result<std::path::PathBuf> {
         .iter()
         .map(std::path::PathBuf::from)
         .find(|p| p.exists())
+        .or_else(playwright_chromium)
         .ok_or_else(|| anyhow!("no chromium-based browser found; set SCOUR_BROWSER=/path/to/brave"))
 }
 
