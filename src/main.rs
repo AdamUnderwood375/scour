@@ -1217,7 +1217,9 @@ fn with_hint(markdown: &str, url: &str, next_offset: Option<usize>, focused_char
     if let Some(f) = focus {
         cmd += &format!(" --focus {}", sh_double(f));
     }
-    format!("{markdown}\n\n<!-- truncated at {n} of {focused_chars} chars; more: {cmd} -->")
+    // focused_chars is 0 for results cached before the field existed.
+    let of = if focused_chars > 0 { format!(" of {focused_chars}") } else { String::new() };
+    format!("{markdown}\n\n<!-- truncated at {n}{of} chars; more: {cmd} -->")
 }
 
 // Shared markdown emitter for the shim and the `scrape` subcommand.
