@@ -238,6 +238,9 @@ pub struct SearchResult {
     /// Per-engine status, e.g. ["ddg:ok:10","bing:ok:9","brave:blocked:captcha","mojeek:timeout"].
     #[serde(default)]
     pub engines: Vec<String>,
+    /// Low-relevance / degraded-coverage advisory (off-topic top hits or <2 ok engines).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub warning: Option<String>,
 }
 
 // ── MCP Server ──────────────────────────────────────────────────────────────
@@ -348,7 +351,7 @@ impl Scour {
         Parameters(req): Parameters<SearchRequest>,
     ) -> Result<Json<SearchResult>, ErrorData> {
         let max = req.max_results.unwrap_or(10).clamp(1, 20);
-        let (hits, engines) = search_run(
+        let (hits, engines, warning) = search_run(
             &req.query,
             max,
             req.site.as_deref(),
@@ -362,6 +365,7 @@ impl Scour {
             total: hits.len(),
             hits,
             engines,
+            warning,
         }))
     }
 
@@ -1720,7 +1724,7 @@ async fn cmd_scrape(args: &[String]) -> anyhow::Result<()> {
 async fn cmd_search(args: &[String]) -> anyhow::Result<()> {
     let o = parse_search(args).unwrap_or_else(|e| usage(&e));
     let t0 = std::time::Instant::now();
-    let (hits, engines) = search_run(&o.query, o.max, o.site.as_deref(), None, o.freshness.as_deref()).await?;
+    let (hits, engines, warning) = search_run(&o.query, o.max, o.site.as_deref(), None, o.freshness.as_deref()).await?;
     let ms = t0.elapsed().as_millis();
     let pages = if o.fetch > 0 {
         let urls: Vec<String> = hits.iter().take(o.fetch).map(|h| h.url.clone()).collect();
@@ -1728,7 +1732,7 @@ async fn cmd_search(args: &[String]) -> anyhow::Result<()> {
     } else {
         Vec::new()
     };
-    let sr = SearchResult { query: o.query.clone(), total: hits.len(), hits, engines };
+    let sr = SearchResult { query: o.query.clone(), total: hits.len(), hits, engines, warning };
     if o.json {
         let mut v = serde_json::to_value(&sr)?;
         if o.fetch > 0 {
@@ -1737,6 +1741,9 @@ async fn cmd_search(args: &[String]) -> anyhow::Result<()> {
         println!("{v}");
     } else {
         println!("# {}", sr.query);
+        if let Some(w) = &sr.warning {
+            println!("<!-- warning: {w} -->");
+        }
         for (idx, h) in sr.hits.iter().enumerate() {
             println!("{}. {} — {}", idx + 1, h.title, h.url);
             if !h.snippet.is_empty() {

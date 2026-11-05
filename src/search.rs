@@ -15,7 +15,9 @@ use crate::fetcher;
 use crate::normalize_url;
 use crate::SearchHit;
 use base64::Engine as _;
+use fs2::FileExt;
 use std::collections::HashMap;
+use std::io::{Read, Seek, Write};
 use std::sync::OnceLock;
 use std::time::Duration;
 
@@ -23,6 +25,128 @@ use std::time::Duration;
 const ENGINE_TIMEOUT: Duration = Duration::from_secs(6);
 /// Reciprocal-rank-fusion constant (standard k = 60).
 const RRF_K: f32 = 60.0;
+
+// ── cross-process engine state (pacing + cooldowns) ─────────────────────────
+// Several `scour search` processes can run within seconds of each other (an LLM
+// agent often fires two in one bash line). We persist per-engine timing in
+// ~/.cache/scour/engines.json under an fs2 file lock so every process paces the
+// same engines and honors cooldowns after a block/captcha, no matter who hit it.
+
+/// Minimum spacing between two requests to the *same* engine, across processes.
+const PACE_MS: u64 = 1100;
+/// Never sleep longer than this to satisfy pacing (keeps latency bounded).
+const PACE_MAX_SLEEP_MS: u64 = 1500;
+/// Cooldown after DDG blocks (it rate-limits hard and recovers slowly).
+const COOLDOWN_DDG_MS: u64 = 10 * 60 * 1000;
+/// Cooldown after any other engine blocks/captchas.
+const COOLDOWN_OTHER_MS: u64 = 2 * 60 * 1000;
+
+#[derive(Default, Clone, serde::Serialize, serde::Deserialize)]
+struct EngineState {
+    #[serde(default)]
+    last_ms: u64,
+    #[serde(default)]
+    cooldown_until_ms: u64,
+}
+
+type EngineStates = HashMap<String, EngineState>;
+
+fn now_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64
+}
+
+fn engines_state_path() -> std::path::PathBuf {
+    let base = std::env::var("HOME").unwrap_or_else(|_| "/home/adam-underwood".to_string());
+    std::path::PathBuf::from(base).join(".cache").join("scour").join("engines.json")
+}
+
+/// Load the engine-state map, tolerating a missing or corrupt file (returns an
+/// empty map). Best-effort, no lock held after return.
+fn load_states() -> EngineStates {
+    let path = engines_state_path();
+    let Ok(file) = std::fs::OpenOptions::new().read(true).open(&path) else {
+        return EngineStates::new();
+    };
+    let _ = file.lock_shared();
+    let mut s = String::new();
+    let mut f = &file;
+    let _ = f.seek(std::io::SeekFrom::Start(0));
+    let _ = f.read_to_string(&mut s);
+    let _ = FileExt::unlock(&file);
+    serde_json::from_str(&s).unwrap_or_default()
+}
+
+/// Pure cooldown test so it can be unit-tested without touching the fs.
+fn in_cooldown(st: &EngineState, now: u64) -> bool {
+    st.cooldown_until_ms > now
+}
+
+/// Pure pacing math: how long to sleep so this engine's next request is >=
+/// PACE_MS after `last_ms`, clamped to PACE_MAX_SLEEP_MS. Returns 0 when enough
+/// time has already passed (or the clock went backwards).
+fn pace_sleep_ms(last_ms: u64, now: u64) -> u64 {
+    if last_ms == 0 || now < last_ms {
+        return 0;
+    }
+    let elapsed = now - last_ms;
+    if elapsed >= PACE_MS {
+        0
+    } else {
+        (PACE_MS - elapsed).min(PACE_MAX_SLEEP_MS)
+    }
+}
+
+/// Cooldown duration for an engine once it reports a block/captcha.
+fn cooldown_ms_for(engine: &str) -> u64 {
+    if engine.starts_with("ddg") {
+        COOLDOWN_DDG_MS
+    } else {
+        COOLDOWN_OTHER_MS
+    }
+}
+
+/// Read-modify-write the state file under an exclusive lock. Best-effort: on any
+/// io/lock error we silently skip the update (pacing degrades, never breaks).
+fn update_state(engine: &str, f: impl FnOnce(&mut EngineState)) {
+    let path = engines_state_path();
+    if let Some(parent) = path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    let Ok(mut file) = std::fs::OpenOptions::new().read(true).write(true).create(true).truncate(false).open(&path)
+    else {
+        return;
+    };
+    if file.lock_exclusive().is_err() {
+        return;
+    }
+    let mut s = String::new();
+    let _ = file.seek(std::io::SeekFrom::Start(0));
+    let _ = file.read_to_string(&mut s);
+    let mut states: EngineStates = serde_json::from_str(&s).unwrap_or_default();
+    f(states.entry(engine.to_string()).or_default());
+    if let Ok(json) = serde_json::to_string(&states) {
+        let _ = file.set_len(0);
+        let _ = file.seek(std::io::SeekFrom::Start(0));
+        let _ = file.write_all(json.as_bytes());
+        let _ = file.flush();
+    }
+    let _ = FileExt::unlock(&file);
+}
+
+/// Mark that we are about to send a request to `engine` (updates last_ms).
+fn record_request(engine: &str) {
+    let now = now_ms();
+    update_state(engine, |st| st.last_ms = now);
+}
+
+/// Put `engine` into cooldown after a block/captcha/429/202.
+fn set_cooldown(engine: &str) {
+    let until = now_ms() + cooldown_ms_for(engine);
+    update_state(engine, |st| st.cooldown_until_ms = until);
+}
 
 // ── selectors ───────────────────────────────────────────────────────────────
 macro_rules! sel {
@@ -54,6 +178,13 @@ sel!(brave_snippet_sel, ".snippet-description, .generic-snippet");
 sel!(ddglite_row_sel, "tr");
 sel!(ddglite_link_sel, "a.result-link");
 sel!(ddglite_snippet_sel, ".result-snippet");
+// Yahoo: each web result is a `div.algo`; the title anchor lives in
+// `div.compTitle a` and wraps an `h3.title`, the snippet in `div.compText`.
+// hrefs are `r.search.yahoo.com/.../RU=<urlencoded target>/RK=...` redirects.
+sel!(yahoo_result_sel, "div.algo");
+sel!(yahoo_link_sel, "div.compTitle a[href]");
+sel!(yahoo_title_sel, "h3.title");
+sel!(yahoo_snippet_sel, "div.compText");
 
 fn text_of(el: scraper::ElementRef) -> String {
     el.text().collect::<Vec<_>>().join(" ").split_whitespace().collect::<Vec<_>>().join(" ")
@@ -65,7 +196,12 @@ fn is_junk_url(url: &str) -> bool {
         return true;
     }
     let host = url::Url::parse(url).ok().and_then(|u| u.host_str().map(|s| s.to_lowercase())).unwrap_or_default();
-    host.ends_with("bing.com") || host.ends_with("duckduckgo.com") || host.ends_with("mojeek.com") || host.ends_with("brave.com") || host.is_empty()
+    host.ends_with("bing.com")
+        || host.ends_with("duckduckgo.com")
+        || host.ends_with("mojeek.com")
+        || host.ends_with("brave.com")
+        || host.ends_with("search.yahoo.com")
+        || host.is_empty()
 }
 
 /// Lowercased host of a URL, or empty when it won't parse.
@@ -162,6 +298,57 @@ pub(crate) fn decode_bing_href(href: &str) -> String {
         }
         Err(_) => href.to_string(),
     }
+}
+
+pub(crate) fn parse_yahoo(html: &str) -> Vec<SearchHit> {
+    let doc = scraper::Html::parse_document(html);
+    let mut hits = Vec::new();
+    for res in doc.select(yahoo_result_sel()) {
+        let Some(a) = res.select(yahoo_link_sel()).next() else { continue };
+        let url = decode_yahoo_href(a.value().attr("href").unwrap_or(""));
+        let title = res.select(yahoo_title_sel()).next().map(text_of).unwrap_or_else(|| text_of(a));
+        let snippet = res.select(yahoo_snippet_sel()).next().map(text_of).unwrap_or_default();
+        push_hit(&mut hits, title, url, snippet);
+    }
+    hits
+}
+
+/// Yahoo wraps targets in `r.search.yahoo.com/...;_ylu=.../RU=<pct-encoded>/RK=...`.
+/// Extract the `RU=` segment (up to the next `/`) and percent-decode it.
+pub(crate) fn decode_yahoo_href(href: &str) -> String {
+    let href = href.trim();
+    let Some(pos) = href.find("RU=") else {
+        return href.to_string();
+    };
+    let rest = &href[pos + 3..];
+    let end = rest.find('/').unwrap_or(rest.len());
+    let decoded = percent_decode(&rest[..end]);
+    if decoded.starts_with("http") {
+        decoded
+    } else {
+        href.to_string()
+    }
+}
+
+/// Minimal `%XX` percent-decoder (Yahoo uses lowercase hex). Non-escape bytes
+/// pass through unchanged; invalid UTF-8 is lossily replaced.
+fn percent_decode(s: &str) -> String {
+    let bytes = s.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'%'
+            && i + 2 < bytes.len()
+            && let Ok(b) = u8::from_str_radix(&s[i + 1..i + 3], 16)
+        {
+            out.push(b);
+            i += 3;
+            continue;
+        }
+        out.push(bytes[i]);
+        i += 1;
+    }
+    String::from_utf8_lossy(&out).into_owned()
 }
 
 pub(crate) fn parse_mojeek(html: &str) -> Vec<SearchHit> {
@@ -357,13 +544,50 @@ fn score(a: &Agg, terms: &[String]) -> f32 {
 
 // ── entry point ─────────────────────────────────────────────────────────────
 
+/// Pace one engine (sleep so it's >= PACE_MS since its last cross-process
+/// request), record the request, then fetch with the per-engine timeout.
+async fn fetch_paced(client: &reqwest::Client, name: &str, url: String, last_ms: u64) -> Option<(u16, String)> {
+    let sl = pace_sleep_ms(last_ms, now_ms());
+    if sl > 0 {
+        tokio::time::sleep(Duration::from_millis(sl)).await;
+    }
+    record_request(name);
+    let fut = async {
+        let resp = client.get(&url).send().await.ok()?;
+        let status = resp.status().as_u16();
+        let body = resp.text().await.ok()?;
+        Some((status, body))
+    };
+    tokio::time::timeout(ENGINE_TIMEOUT, fut).await.ok().flatten()
+}
+
+/// Run one engine end-to-end: honor cooldown, pace, fetch, classify, and open a
+/// cooldown on a block/captcha/429/202. Returns (hits, `<name>:<status>`).
+async fn run_engine(
+    client: &reqwest::Client,
+    name: &'static str,
+    url: String,
+    parse: fn(&str) -> Vec<SearchHit>,
+    cooled: bool,
+    last_ms: u64,
+) -> (Vec<SearchHit>, String) {
+    if cooled {
+        return (Vec::new(), format!("{name}:skipped:cooldown"));
+    }
+    let (hits, status) = classify(fetch_paced(client, name, url, last_ms).await, parse);
+    if status.starts_with("blocked") {
+        set_cooldown(name);
+    }
+    (hits, format!("{name}:{status}"))
+}
+
 pub(crate) async fn search_run(
     query: &str,
     max_results: usize,
     site: Option<&str>,
     exclude_sites: Option<&[String]>,
     freshness: Option<&str>,
-) -> anyhow::Result<(Vec<SearchHit>, Vec<String>)> {
+) -> anyhow::Result<(Vec<SearchHit>, Vec<String>, Option<String>)> {
     let max_results = max_results.clamp(1, 20);
     let client = fetcher::client();
 
@@ -390,59 +614,67 @@ pub(crate) async fn search_run(
     }
     let q = urlencoding(&effective);
     let ddg_url = format!("https://html.duckduckgo.com/html/?q={q}");
-    let bing_url = format!("https://www.bing.com/search?q={q}");
+    let lite_url = format!("https://lite.duckduckgo.com/lite/?q={q}");
+    // setlang/cc/form pin Bing to US-English results; without them this IP gets
+    // off-topic junk (e.g. the Rust *video game*) for developer queries.
+    let bing_url = format!("https://www.bing.com/search?q={q}&setlang=en&cc=US&form=QBLH");
     let mojeek_url = format!("https://www.mojeek.com/search?q={q}");
     let brave_url = format!("https://search.brave.com/search?q={q}&source=web");
+    let yahoo_url = format!("https://search.yahoo.com/search?p={q}&n=10");
 
-    // Fetch returns (status, body) so the caller can distinguish a 202/403 wall
-    // from a 200 captcha page from a timeout.
-    let fetch = |url: String| async move {
-        let fut = async {
-            let resp = client.get(&url).send().await.ok()?;
-            let status = resp.status().as_u16();
-            let body = resp.text().await.ok()?;
-            Some((status, body))
-        };
-        tokio::time::timeout(ENGINE_TIMEOUT, fut).await.ok().flatten()
-    };
-    let (ddg, bing, mojeek, brave) =
-        tokio::join!(fetch(ddg_url), fetch(bing_url), fetch(mojeek_url), fetch(brave_url));
+    // Cross-process pacing/cooldown snapshot: decide skips and sleeps from the
+    // shared state file so parallel `scour search` runs don't hammer one engine.
+    let states = load_states();
+    let now = now_ms();
+    let cooled = |name: &str| states.get(name).map(|s| in_cooldown(s, now)).unwrap_or(false);
+    let last_of = |name: &str| states.get(name).map(|s| s.last_ms).unwrap_or(0);
 
-    // DDG: if the main html endpoint is blocked/empty/timed out, retry once via
-    // the lite endpoint before giving up on DuckDuckGo entirely.
-    let (ddg_hits, ddg_status) = {
-        let (hits, status) = classify(ddg, parse_ddg);
+    // DDG: pace + cooldown under the shared "ddg" slot, with a lite fallback when
+    // the main html endpoint is blocked/empty/timed out.
+    let ddg_task = async {
+        if cooled("ddg") {
+            return (Vec::new(), "ddg:skipped:cooldown".to_string());
+        }
+        let (hits, status) = classify(fetch_paced(client, "ddg", ddg_url, last_of("ddg")).await, parse_ddg);
         if status.starts_with("ok") {
-            (hits, format!("ddg:{status}"))
+            return (hits, format!("ddg:{status}"));
+        }
+        if status.starts_with("blocked") {
+            set_cooldown("ddg");
+        }
+        // Lite fallback shares the ddg slot; last_ms=0 skips a second sleep.
+        let (lhits, lstatus) = classify(fetch_paced(client, "ddg", lite_url, 0).await, parse_ddg_lite);
+        if lstatus.starts_with("ok") {
+            (lhits, format!("ddg-lite:{lstatus}"))
         } else {
-            let lite_url = format!("https://lite.duckduckgo.com/lite/?q={q}");
-            let (lhits, lstatus) = classify(fetch(lite_url).await, parse_ddg_lite);
-            if lstatus.starts_with("ok") {
-                (lhits, format!("ddg-lite:{lstatus}"))
-            } else {
-                (hits, format!("ddg:{status}"))
-            }
+            (hits, format!("ddg:{status}"))
         }
     };
-    let (bing_hits, bing_status) = classify(bing, parse_bing);
-    let (brave_hits, brave_status) = classify(brave, parse_brave);
-    let (mojeek_hits, mojeek_status) = classify(mojeek, parse_mojeek);
+
+    let (ddg_r, bing_r, brave_r, mojeek_r, yahoo_r) = tokio::join!(
+        ddg_task,
+        run_engine(client, "bing", bing_url, parse_bing, cooled("bing"), last_of("bing")),
+        run_engine(client, "brave", brave_url, parse_brave, cooled("brave"), last_of("brave")),
+        run_engine(client, "mojeek", mojeek_url, parse_mojeek, cooled("mojeek"), last_of("mojeek")),
+        run_engine(client, "yahoo", yahoo_url, parse_yahoo, cooled("yahoo"), last_of("yahoo")),
+    );
 
     let engines = vec![
-        ddg_status.clone(),
-        format!("bing:{bing_status}"),
-        format!("brave:{brave_status}"),
-        format!("mojeek:{mojeek_status}"),
+        ddg_r.1.clone(),
+        bing_r.1.clone(),
+        brave_r.1.clone(),
+        mojeek_r.1.clone(),
+        yahoo_r.1.clone(),
     ];
+    let ok_count = engines.iter().filter(|e| e.contains(":ok:")).count();
     // Every engine failed (none returned ok) — surface the block, don't lie
     // "no results".
-    let any_ok = ddg_status.contains(":ok:") || bing_status.starts_with("ok") || brave_status.starts_with("ok") || mojeek_status.starts_with("ok");
-    if !any_ok {
+    if ok_count == 0 {
         anyhow::bail!("all search engines failed: [{}]", engines.join(", "));
     }
 
     let terms = query_terms(query);
-    let mut merged = fuse_and_rank(vec![ddg_hits, bing_hits, brave_hits, mojeek_hits], &terms);
+    let mut merged = fuse_and_rank(vec![ddg_r.0, bing_r.0, brave_r.0, mojeek_r.0, yahoo_r.0], &terms);
 
     if let Some(s) = site
         && !s.trim().is_empty()
@@ -459,8 +691,46 @@ pub(crate) async fn search_run(
         }
     }
 
+    let warning = low_relevance_warning(&merged, &terms, &engines, ok_count);
+    // Drop obvious off-topic noise: when enough hits cover at least one query
+    // term, zero-coverage hits are junk from an engine that answered a different
+    // question (e.g. Bing returning the Rust video game).
+    drop_zero_coverage(&mut merged, &terms);
+
     merged.truncate(max_results);
-    Ok((merged, engines))
+    Ok((merged, engines, warning))
+}
+
+/// Drop hits with zero query-term coverage, but only when at least 3 hits
+/// actually cover something — otherwise a sparse-but-valid result set survives.
+fn drop_zero_coverage(merged: &mut Vec<SearchHit>, terms: &[String]) {
+    if terms.is_empty() {
+        return;
+    }
+    let positive = merged.iter().filter(|h| coverage(h, terms) > 0.0).count();
+    if positive >= 3 {
+        merged.retain(|h| coverage(h, terms) > 0.0);
+    }
+}
+
+/// Low-relevance signal: warn when the best hit covers < half the distinct query
+/// terms, or fewer than 2 engines returned results. Returns the human-readable
+/// warning string (also surfaced as `<!-- warning: … -->` and in --json).
+fn low_relevance_warning(merged: &[SearchHit], terms: &[String], engines: &[String], ok_count: usize) -> Option<String> {
+    if terms.is_empty() {
+        return None;
+    }
+    let best_cov = merged.first().map(|h| coverage(h, terms)).unwrap_or(0.0);
+    if best_cov >= 0.5 && ok_count >= 2 {
+        return None;
+    }
+    let found = (best_cov * terms.len() as f32).round() as usize;
+    Some(format!(
+        "low relevance: top hits cover {}/{} query terms; engines: {} — retry later, rephrase with fewer terms, or fetch known URLs",
+        found,
+        terms.len(),
+        engines.join(","),
+    ))
 }
 
 // ── url encoding ────────────────────────────────────────────────────────────
@@ -622,6 +892,86 @@ mod tests {
             &terms,
         );
         assert_eq!(out[0].url, compare.url, "full-coverage hit must rank first");
+    }
+
+    #[test]
+    fn pacing_math() {
+        // No prior request ⇒ no sleep.
+        assert_eq!(pace_sleep_ms(0, 10_000), 0);
+        // Enough time already elapsed ⇒ no sleep.
+        assert_eq!(pace_sleep_ms(1_000, 1_000 + PACE_MS), 0);
+        assert_eq!(pace_sleep_ms(1_000, 10_000), 0);
+        // Clock went backwards ⇒ no sleep (never negative/underflow).
+        assert_eq!(pace_sleep_ms(10_000, 1_000), 0);
+        // Partway through the window ⇒ sleep the remainder.
+        assert_eq!(pace_sleep_ms(1_000, 1_100), PACE_MS - 100);
+        // Never sleep longer than the cap even with a tiny gap.
+        assert_eq!(pace_sleep_ms(1_000, 1_001), PACE_MAX_SLEEP_MS.min(PACE_MS - 1));
+    }
+
+    #[test]
+    fn cooldown_skip_and_duration() {
+        let now = 1_000_000;
+        let active = EngineState { last_ms: 0, cooldown_until_ms: now + 5_000 };
+        let expired = EngineState { last_ms: 0, cooldown_until_ms: now - 1 };
+        assert!(in_cooldown(&active, now));
+        assert!(!in_cooldown(&expired, now));
+        assert!(!in_cooldown(&EngineState::default(), now));
+        // DDG cools down far longer than the others.
+        assert_eq!(cooldown_ms_for("ddg"), COOLDOWN_DDG_MS);
+        assert_eq!(cooldown_ms_for("ddg-lite"), COOLDOWN_DDG_MS);
+        assert_eq!(cooldown_ms_for("bing"), COOLDOWN_OTHER_MS);
+        assert!(COOLDOWN_DDG_MS > COOLDOWN_OTHER_MS);
+    }
+
+    #[test]
+    fn yahoo_fixture_parses_and_decodes_ru() {
+        let html = include_str!("../tests/fixtures/yahoo.html");
+        let hits = parse_yahoo(html);
+        assert!(hits.len() >= 3, "got {}", hits.len());
+        // RU= redirect decoded to the real target, no yahoo redirect host leaks.
+        assert!(hits.iter().all(|h| h.url.starts_with("http")));
+        assert!(hits.iter().all(|h| !h.url.contains("search.yahoo.com")), "RU not decoded");
+        assert!(hits.iter().any(|h| !h.snippet.is_empty()), "expected snippets");
+        assert!(hits.iter().any(|h| h.title.to_lowercase().contains("axum")), "expected on-topic titles");
+    }
+
+    #[test]
+    fn yahoo_ru_decode_unit() {
+        let href = "https://r.search.yahoo.com/_ylt=A0;_ylu=X3/RU=https%3a%2f%2fgithub.com%2ftokio-rs%2faxum/RK=2/RS=abc";
+        assert_eq!(decode_yahoo_href(href), "https://github.com/tokio-rs/axum");
+        // non-redirect passes through unchanged.
+        assert_eq!(decode_yahoo_href("https://example.com/x"), "https://example.com/x");
+    }
+
+    #[test]
+    fn low_relevance_warning_fires() {
+        let terms = query_terms("axum vs actix web 2025"); // axum, actix, web
+        // Top hit covers only 1/3 terms ⇒ warn, and report 1/3.
+        let weak = vec![SearchHit { title: "Axum town".into(), url: "https://x.com/a".into(), snippet: "ethiopia".into() }];
+        let engines = vec!["bing:ok:7".into(), "yahoo:ok:7".into()];
+        let w = low_relevance_warning(&weak, &terms, &engines, 2).expect("warn");
+        assert!(w.contains("1/3"), "{w}");
+        assert!(w.contains("bing:ok:7,yahoo:ok:7"), "{w}");
+        // Strong coverage + 2 ok engines ⇒ no warning.
+        let strong = vec![SearchHit { title: "axum vs actix web".into(), url: "https://x.com/b".into(), snippet: "".into() }];
+        assert!(low_relevance_warning(&strong, &terms, &engines, 2).is_none());
+        // Good coverage but only 1 ok engine ⇒ warn.
+        assert!(low_relevance_warning(&strong, &terms, &engines, 1).is_some());
+    }
+
+    #[test]
+    fn zero_coverage_dropped_when_enough_signal() {
+        let terms = query_terms("axum actix web");
+        let mk = |t: &str| SearchHit { title: t.into(), url: "https://x.com/".to_string() + t, snippet: String::new() };
+        let mut hits = vec![mk("axum"), mk("actix"), mk("web"), mk("unrelated video game")];
+        drop_zero_coverage(&mut hits, &terms);
+        assert_eq!(hits.len(), 3, "zero-coverage junk should be dropped");
+        assert!(hits.iter().all(|h| coverage(h, &terms) > 0.0));
+        // Too few positive hits ⇒ keep everything (don't nuke a sparse set).
+        let mut sparse = vec![mk("axum"), mk("nothing here")];
+        drop_zero_coverage(&mut sparse, &terms);
+        assert_eq!(sparse.len(), 2);
     }
 
     #[test]
