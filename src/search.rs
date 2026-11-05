@@ -17,7 +17,7 @@ use crate::SearchHit;
 use base64::Engine as _;
 use fs2::FileExt;
 use std::collections::HashMap;
-use std::io::{Read, Seek, Write};
+use std::io::{Read, Seek};
 use std::sync::OnceLock;
 use std::time::Duration;
 
@@ -33,6 +33,11 @@ const RRF_K: f32 = 60.0;
 // same engines and honors cooldowns after a block/captcha, no matter who hit it.
 
 /// Minimum spacing between two requests to the *same* engine, across processes.
+// Pacing serializes *staggered* processes (each reads the shared last_ms before
+// its own request), but gives no guarantee for *perfectly simultaneous* ones:
+// two processes that read the state at the same instant both see the same
+// last_ms and may fire together. This is best-effort smoothing, not a hard rate
+// limit.
 const PACE_MS: u64 = 1100;
 /// Never sleep longer than this to satisfy pacing (keeps latency bounded).
 const PACE_MAX_SLEEP_MS: u64 = 1500;
@@ -128,10 +133,13 @@ fn update_state(engine: &str, f: impl FnOnce(&mut EngineState)) {
     let mut states: EngineStates = serde_json::from_str(&s).unwrap_or_default();
     f(states.entry(engine.to_string()).or_default());
     if let Ok(json) = serde_json::to_string(&states) {
-        let _ = file.set_len(0);
-        let _ = file.seek(std::io::SeekFrom::Start(0));
-        let _ = file.write_all(json.as_bytes());
-        let _ = file.flush();
+        // Atomic replace: write a temp file in the same dir, then rename over the
+        // target (rename is atomic on the same filesystem) so readers never see a
+        // half-written file. Still done while holding the fs2 lock on the original.
+        let tmp = path.with_extension("json.tmp");
+        if std::fs::write(&tmp, json.as_bytes()).is_ok() {
+            let _ = std::fs::rename(&tmp, &path);
+        }
     }
     let _ = FileExt::unlock(&file);
 }
@@ -146,6 +154,27 @@ fn record_request(engine: &str) {
 fn set_cooldown(engine: &str) {
     let until = now_ms() + cooldown_ms_for(engine);
     update_state(engine, |st| st.cooldown_until_ms = until);
+}
+
+/// Engine slots used for pacing/cooldown (must match the names passed to
+/// `run_engine` / the ddg task in `search_run`).
+const ENGINE_NAMES: &[&str] = &["ddg", "bing", "brave", "mojeek", "yahoo"];
+
+/// When *every* engine is in cooldown, pick the engine(s) whose cooldown expires
+/// soonest to force-run anyway (prefer the 2 soonest), so a search never returns
+/// "all failed" without a live network attempt. Returns the engine names to
+/// bypass; empty when at least one engine is already available. Pure so it can
+/// be unit-tested without touching the fs.
+fn cooldown_bypass(states: &EngineStates, now: u64) -> Vec<String> {
+    let all_cooled = ENGINE_NAMES
+        .iter()
+        .all(|n| states.get(*n).map(|s| in_cooldown(s, now)).unwrap_or(false));
+    if !all_cooled {
+        return Vec::new();
+    }
+    let mut by_soonest: Vec<&str> = ENGINE_NAMES.to_vec();
+    by_soonest.sort_by_key(|n| states.get(*n).map(|s| s.cooldown_until_ms).unwrap_or(0));
+    by_soonest.into_iter().take(2).map(|s| s.to_string()).collect()
 }
 
 // ── selectors ───────────────────────────────────────────────────────────────
@@ -337,11 +366,17 @@ fn percent_decode(s: &str) -> String {
     let mut out = Vec::with_capacity(bytes.len());
     let mut i = 0;
     while i < bytes.len() {
+        // Operate on bytes, never str slices: a multibyte char right after '%'
+        // would make `&s[i+1..i+3]` fall on a non-char-boundary and panic. Only
+        // decode when both following bytes are ASCII hex; otherwise keep '%'.
         if bytes[i] == b'%'
             && i + 2 < bytes.len()
-            && let Ok(b) = u8::from_str_radix(&s[i + 1..i + 3], 16)
+            && bytes[i + 1].is_ascii_hexdigit()
+            && bytes[i + 2].is_ascii_hexdigit()
         {
-            out.push(b);
+            let hi = (bytes[i + 1] as char).to_digit(16).unwrap() as u8;
+            let lo = (bytes[i + 2] as char).to_digit(16).unwrap() as u8;
+            out.push(hi << 4 | lo);
             i += 3;
             continue;
         }
@@ -428,13 +463,21 @@ pub(crate) fn detect_block(html: &str) -> Option<&'static str> {
 }
 
 /// Classify one engine fetch into (hits, status) where status is one of
-/// `ok:<n>` / `empty` / `blocked:<reason>` / `timeout`.
+/// `ok:<n>` / `empty` / `blocked:<reason>` / `error:http<status>` / `timeout`.
+/// Only real blocks (202 DDG anomaly, 403, 429, captcha/anomaly markers) are
+/// reported as `blocked:*` (the caller opens a cooldown on those). Transient 5xx
+/// and other non-200s become `error:http<status>` with no cooldown, so one flaky
+/// 502/503 never blacks out an engine for minutes.
 fn classify(resp: Option<(u16, String)>, parse: impl Fn(&str) -> Vec<SearchHit>) -> (Vec<SearchHit>, String) {
     match resp {
         None => (Vec::new(), "timeout".into()),
         Some((status, body)) => {
             if status != 200 {
-                return (Vec::new(), format!("blocked:http{status}"));
+                return if matches!(status, 202 | 403 | 429) {
+                    (Vec::new(), format!("blocked:http{status}"))
+                } else {
+                    (Vec::new(), format!("error:http{status}"))
+                };
             }
             if let Some(reason) = detect_block(&body) {
                 return (Vec::new(), format!("blocked:{reason}"));
@@ -562,13 +605,16 @@ async fn fetch_paced(client: &reqwest::Client, name: &str, url: String, last_ms:
 }
 
 /// Run one engine end-to-end: honor cooldown, pace, fetch, classify, and open a
-/// cooldown on a block/captcha/429/202. Returns (hits, `<name>:<status>`).
+/// cooldown on a block/captcha/429/202. Returns (hits, `<name>:<status>`). When
+/// `bypass` is set this engine was force-run despite its cooldown (all engines
+/// were cooled); its status is suffixed `(cooldown-bypass)`.
 async fn run_engine(
     client: &reqwest::Client,
     name: &'static str,
     url: String,
     parse: fn(&str) -> Vec<SearchHit>,
     cooled: bool,
+    bypass: bool,
     last_ms: u64,
 ) -> (Vec<SearchHit>, String) {
     if cooled {
@@ -578,7 +624,8 @@ async fn run_engine(
     if status.starts_with("blocked") {
         set_cooldown(name);
     }
-    (hits, format!("{name}:{status}"))
+    let sfx = if bypass { "(cooldown-bypass)" } else { "" };
+    (hits, format!("{name}:{status}{sfx}"))
 }
 
 pub(crate) async fn search_run(
@@ -626,18 +673,25 @@ pub(crate) async fn search_run(
     // shared state file so parallel `scour search` runs don't hammer one engine.
     let states = load_states();
     let now = now_ms();
-    let cooled = |name: &str| states.get(name).map(|s| in_cooldown(s, now)).unwrap_or(false);
+    // If every engine is in cooldown, force-run the soonest-expiring one(s) so we
+    // always make a live attempt instead of bailing "all failed" offline.
+    let bypass = cooldown_bypass(&states, now);
+    let bypassed = |name: &str| bypass.iter().any(|b| b == name);
+    let cooled =
+        |name: &str| states.get(name).map(|s| in_cooldown(s, now)).unwrap_or(false) && !bypassed(name);
     let last_of = |name: &str| states.get(name).map(|s| s.last_ms).unwrap_or(0);
 
     // DDG: pace + cooldown under the shared "ddg" slot, with a lite fallback when
     // the main html endpoint is blocked/empty/timed out.
+    let ddg_bypass = bypassed("ddg");
     let ddg_task = async {
+        let sfx = if ddg_bypass { "(cooldown-bypass)" } else { "" };
         if cooled("ddg") {
             return (Vec::new(), "ddg:skipped:cooldown".to_string());
         }
         let (hits, status) = classify(fetch_paced(client, "ddg", ddg_url, last_of("ddg")).await, parse_ddg);
         if status.starts_with("ok") {
-            return (hits, format!("ddg:{status}"));
+            return (hits, format!("ddg:{status}{sfx}"));
         }
         if status.starts_with("blocked") {
             set_cooldown("ddg");
@@ -645,18 +699,18 @@ pub(crate) async fn search_run(
         // Lite fallback shares the ddg slot; last_ms=0 skips a second sleep.
         let (lhits, lstatus) = classify(fetch_paced(client, "ddg", lite_url, 0).await, parse_ddg_lite);
         if lstatus.starts_with("ok") {
-            (lhits, format!("ddg-lite:{lstatus}"))
+            (lhits, format!("ddg-lite:{lstatus}{sfx}"))
         } else {
-            (hits, format!("ddg:{status}"))
+            (hits, format!("ddg:{status}{sfx}"))
         }
     };
 
     let (ddg_r, bing_r, brave_r, mojeek_r, yahoo_r) = tokio::join!(
         ddg_task,
-        run_engine(client, "bing", bing_url, parse_bing, cooled("bing"), last_of("bing")),
-        run_engine(client, "brave", brave_url, parse_brave, cooled("brave"), last_of("brave")),
-        run_engine(client, "mojeek", mojeek_url, parse_mojeek, cooled("mojeek"), last_of("mojeek")),
-        run_engine(client, "yahoo", yahoo_url, parse_yahoo, cooled("yahoo"), last_of("yahoo")),
+        run_engine(client, "bing", bing_url, parse_bing, cooled("bing"), bypassed("bing"), last_of("bing")),
+        run_engine(client, "brave", brave_url, parse_brave, cooled("brave"), bypassed("brave"), last_of("brave")),
+        run_engine(client, "mojeek", mojeek_url, parse_mojeek, cooled("mojeek"), bypassed("mojeek"), last_of("mojeek")),
+        run_engine(client, "yahoo", yahoo_url, parse_yahoo, cooled("yahoo"), bypassed("yahoo"), last_of("yahoo")),
     );
 
     let engines = vec![
@@ -922,6 +976,56 @@ mod tests {
         assert_eq!(cooldown_ms_for("ddg-lite"), COOLDOWN_DDG_MS);
         assert_eq!(cooldown_ms_for("bing"), COOLDOWN_OTHER_MS);
         assert!(COOLDOWN_DDG_MS > COOLDOWN_OTHER_MS);
+    }
+
+    #[test]
+    fn cooldown_bypass_picks_soonest() {
+        let now = 1_000_000;
+        let mk = |until: u64| EngineState { last_ms: 0, cooldown_until_ms: until };
+        let mut states = EngineStates::new();
+        states.insert("ddg".into(), mk(now + 9_000));
+        states.insert("bing".into(), mk(now + 1_000));
+        states.insert("brave".into(), mk(now + 2_000));
+        states.insert("mojeek".into(), mk(now + 8_000));
+        states.insert("yahoo".into(), mk(now + 5_000));
+        // All cooled ⇒ force-run the 2 soonest-expiring.
+        assert_eq!(cooldown_bypass(&states, now), vec!["bing".to_string(), "brave".to_string()]);
+        // One engine already available ⇒ no bypass.
+        states.insert("yahoo".into(), mk(now - 1));
+        assert!(cooldown_bypass(&states, now).is_empty());
+        // Never-used engines count as available ⇒ no bypass.
+        assert!(cooldown_bypass(&EngineStates::new(), now).is_empty());
+    }
+
+    #[test]
+    fn classify_cooldown_only_on_real_blocks() {
+        let parse = |_: &str| Vec::<SearchHit>::new();
+        // Real blocks ⇒ `blocked:*` (caller opens a cooldown).
+        for s in [202u16, 403, 429] {
+            let (_, st) = classify(Some((s, String::new())), parse);
+            assert!(st.starts_with("blocked"), "{s} -> {st}");
+        }
+        // Transient 5xx / other errors ⇒ `error:*`, no cooldown.
+        for s in [500u16, 502, 503, 404] {
+            let (_, st) = classify(Some((s, String::new())), parse);
+            assert_eq!(st, format!("error:http{s}"));
+            assert!(!st.starts_with("blocked"));
+        }
+        // Timeout never cools down.
+        assert_eq!(classify(None, parse).1, "timeout");
+    }
+
+    #[test]
+    fn percent_decode_handles_multibyte_and_bad_hex() {
+        // Normal escapes decode.
+        assert_eq!(percent_decode("a%20b"), "a b");
+        assert_eq!(percent_decode("caf%C3%A9"), "café");
+        // Multibyte char right after '%' must not panic; '%' kept literally.
+        assert_eq!(percent_decode("%\u{20ac}"), "%\u{20ac}");
+        // Invalid hex after '%' kept literally.
+        assert_eq!(percent_decode("100%zz"), "100%zz");
+        // Trailing '%' with no room to decode.
+        assert_eq!(percent_decode("abc%"), "abc%");
     }
 
     #[test]
