@@ -195,7 +195,8 @@ pub fn client() -> &'static reqwest::Client {
                  (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
             )
             .cookie_store(true)
-            .timeout(Duration::from_secs(20))
+            .connect_timeout(Duration::from_secs(6))
+            .timeout(Duration::from_secs(15))
             // SSRF guard: only ever connect to public addresses, and bound
             // redirects so a page can't bounce us onto an internal host.
             .dns_resolver(Arc::new(PublicOnlyDns))
@@ -493,6 +494,11 @@ fn fetch_chrome_blocking(
 }
 
 /// Fetch `url`, escalating to a real browser only when the cheap path is blocked.
+fn is_timeout_error(e: &anyhow::Error) -> bool {
+    e.chain()
+        .any(|c| c.downcast_ref::<reqwest::Error>().is_some_and(|r| r.is_timeout()))
+}
+
 pub async fn fetch(url: &str) -> Result<Fetched> {
     let cheap = fetch_http(url).await;
     match &cheap {
@@ -500,6 +506,9 @@ pub async fn fetch(url: &str) -> Result<Fetched> {
         // SSRF block: hand the error straight back. Escalating would just load
         // the internal URL in a browser that has no DNS guard.
         Err(e) if is_block_error(e) => return cheap,
+        // A host that doesn't answer plain HTTP won't answer Chrome either;
+        // escalating just burns another 30s navigation timeout.
+        Err(e) if is_timeout_error(e) => return cheap,
         _ => {}
     }
     // Chrome resolves DNS itself, bypassing PublicOnlyDns — guard before it

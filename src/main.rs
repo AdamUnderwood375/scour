@@ -1668,6 +1668,8 @@ type PageFetch = (String, anyhow::Result<(ScrapeResult, Stats)>);
 
 /// Scrapes `urls` concurrently (at most `parallel`, clamped 1..=8). One entry per input URL,
 /// in input order: a failed or panicked task is an `Err` entry, never dropped.
+const PAGE_DEADLINE: Duration = Duration::from_secs(25);
+
 async fn fetch_all(urls: Vec<String>, focus: Option<String>, max_chars: usize, parallel: usize, op: &'static str) -> Vec<PageFetch> {
     let sem = std::sync::Arc::new(tokio::sync::Semaphore::new(parallel.clamp(1, 8)));
     let handles: Vec<_> = urls
@@ -1678,8 +1680,11 @@ async fn fetch_all(urls: Vec<String>, focus: Option<String>, max_chars: usize, p
             let focus = focus.clone();
             tokio::spawn(async move {
                 let _permit = sem.acquire_owned().await;
-                run_ext_stats(&url, focus.as_deref(), max_chars, true, None, false, None, None)
+                // One dead host must not hold up the whole batch.
+                let fut = run_ext_stats(&url, focus.as_deref(), max_chars, true, None, false, None, None);
+                tokio::time::timeout(PAGE_DEADLINE, fut)
                     .await
+                    .unwrap_or_else(|_| Err(anyhow::anyhow!("timed out after {}s", PAGE_DEADLINE.as_secs())))
                     .map(|(r, mut st)| {
                         st.op = op;
                         (r, st)
@@ -1999,6 +2004,20 @@ async fn cmd_screenshot(args: &[String]) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Exit right after a CLI command. Returning from main would make the tokio
+/// runtime wait for timed-out headless-Chrome `spawn_blocking` work.
+fn finish(r: anyhow::Result<()>) -> ! {
+    use std::io::Write;
+    let _ = std::io::stdout().flush();
+    match r {
+        Ok(()) => std::process::exit(0),
+        Err(e) => {
+            eprintln!("Error: {e:?}");
+            std::process::exit(1)
+        }
+    }
+}
+
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     let args: Vec<String> = std::env::args().skip(1).collect();
@@ -2013,14 +2032,14 @@ async fn main() -> anyhow::Result<()> {
             println!("{}", serde_json::to_string(&version_info()).unwrap_or_default());
             return Ok(());
         }
-        Some("scrape") => return cmd_scrape(&args[1..]).await,
-        Some("search") => return cmd_search(&args[1..]).await,
-        Some("batch") => return cmd_batch(&args[1..]).await,
-        Some("gh") => return cmd_gh(&args[1..]).await,
-        Some("pkg") => return cmd_pkg(&args[1..]).await,
-        Some("links") => return cmd_links(&args[1..]).await,
-        Some("crawl") => return cmd_crawl(&args[1..]).await,
-        Some("screenshot") => return cmd_screenshot(&args[1..]).await,
+        Some("scrape") => finish(cmd_scrape(&args[1..]).await),
+        Some("search") => finish(cmd_search(&args[1..]).await),
+        Some("batch") => finish(cmd_batch(&args[1..]).await),
+        Some("gh") => finish(cmd_gh(&args[1..]).await),
+        Some("pkg") => finish(cmd_pkg(&args[1..]).await),
+        Some("links") => finish(cmd_links(&args[1..]).await),
+        Some("crawl") => finish(cmd_crawl(&args[1..]).await),
+        Some("screenshot") => finish(cmd_screenshot(&args[1..]).await),
         Some("cache-clear") => {
             cache::cache_clear();
             eprintln!("cache cleared");
@@ -2029,7 +2048,7 @@ async fn main() -> anyhow::Result<()> {
         // A mistyped subcommand (`serch x`) is not a URL.
         Some(s) if is_bare_word(s) => usage(&format!("unknown command '{s}'")),
         // Bare URL or leading flags: shorthand for `scrape <url> [focus...] [flags]`.
-        Some(_) => return cmd_scrape(&args).await,
+        Some(_) => finish(cmd_scrape(&args).await),
     }
     use rmcp::ServiceExt;
     let service = Scour::new().serve(rmcp::transport::stdio()).await?;
