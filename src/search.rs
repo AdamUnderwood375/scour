@@ -1,9 +1,15 @@
-//! Keyless web search (DuckDuckGo / Bing / Mojeek).
+//! Keyless web search (DuckDuckGo / Bing / Mojeek / Brave).
 //!
 //! Each engine is queried in parallel with its own timeout so one slow or
 //! blocked engine never fails the whole search. Results are merged with
 //! reciprocal-rank fusion, deduped by normalized URL, then reranked by how
 //! many distinct query terms each hit covers.
+//!
+//! Every engine is classified (`ok:<n>` / `empty` / `blocked:<reason>` /
+//! `timeout`) and the per-engine statuses are returned alongside the hits so
+//! the caller can tell a block apart from a genuine no-results. DDG's main
+//! html endpoint rate-limits aggressively (HTTP 202 anomaly page); when it
+//! fails we retry once via the DDG lite endpoint.
 
 use crate::fetcher;
 use crate::normalize_url;
@@ -37,6 +43,14 @@ sel!(bing_caption_sel, ".b_caption p, .b_lineclamp2, .b_lineclamp3, .b_lineclamp
 sel!(mojeek_result_sel, "ul.results-standard li");
 sel!(mojeek_title_sel, "a.title");
 sel!(mojeek_snippet_sel, "p.s");
+// Brave renders results with Svelte (hashed classes); select on the stable
+// semantic attributes/prefixes only.
+sel!(brave_result_sel, "div[data-type=\"web\"]");
+sel!(brave_title_sel, ".search-snippet-title");
+sel!(brave_snippet_sel, ".snippet-description, .generic-snippet");
+// DDG lite is a flat table: one `a.result-link` + one `td.result-snippet` per hit.
+sel!(ddglite_link_sel, "a.result-link");
+sel!(ddglite_snippet_sel, ".result-snippet");
 
 fn text_of(el: scraper::ElementRef) -> String {
     el.text().collect::<Vec<_>>().join(" ").split_whitespace().collect::<Vec<_>>().join(" ")
@@ -48,7 +62,7 @@ fn is_junk_url(url: &str) -> bool {
         return true;
     }
     let host = url::Url::parse(url).ok().and_then(|u| u.host_str().map(|s| s.to_lowercase())).unwrap_or_default();
-    host.ends_with("bing.com") || host.ends_with("duckduckgo.com") || host.ends_with("mojeek.com") || host.is_empty()
+    host.ends_with("bing.com") || host.ends_with("duckduckgo.com") || host.ends_with("mojeek.com") || host.ends_with("brave.com") || host.is_empty()
 }
 
 fn push_hit(hits: &mut Vec<SearchHit>, title: String, url: String, snippet: String) {
@@ -141,6 +155,80 @@ pub(crate) fn parse_mojeek(html: &str) -> Vec<SearchHit> {
         push_hit(&mut hits, title, url, snippet);
     }
     hits
+}
+
+/// Each web result is a `div[data-type="web"]`; the first anchor in it holds the
+/// (already-direct) target URL, `.search-snippet-title` the title, and
+/// `.generic-snippet` / `.snippet-description` the description.
+pub(crate) fn parse_brave(html: &str) -> Vec<SearchHit> {
+    let doc = scraper::Html::parse_document(html);
+    let mut hits = Vec::new();
+    for res in doc.select(brave_result_sel()) {
+        let Some(a) = res.select(a_href_sel()).next() else { continue };
+        let url = a.value().attr("href").unwrap_or("").trim().to_string();
+        let title = res.select(brave_title_sel()).next().map(text_of).unwrap_or_else(|| text_of(a));
+        let snippet = res.select(brave_snippet_sel()).next().map(text_of).unwrap_or_default();
+        push_hit(&mut hits, title, url, snippet);
+    }
+    hits
+}
+
+/// DDG lite has no result containers — links and snippets are separate table
+/// cells in document order, so zip them positionally. URLs are the same
+/// `/l/?uddg=` redirects as the main endpoint.
+pub(crate) fn parse_ddg_lite(html: &str) -> Vec<SearchHit> {
+    let doc = scraper::Html::parse_document(html);
+    let snippets: Vec<String> = doc.select(ddglite_snippet_sel()).map(text_of).collect();
+    let mut hits = Vec::new();
+    for (i, a) in doc.select(ddglite_link_sel()).enumerate() {
+        let title = text_of(a);
+        let url = resolve_ddg_href(a.value().attr("href").unwrap_or(""));
+        let snippet = snippets.get(i).cloned().unwrap_or_default();
+        push_hit(&mut hits, title, url, snippet);
+    }
+    hits
+}
+
+/// Known captcha / anomaly / bot-wall markers in an otherwise-200 body. Returns
+/// a short reason tag when the body is a block page rather than real results.
+pub(crate) fn detect_block(html: &str) -> Option<&'static str> {
+    let h = html.to_lowercase();
+    if h.contains("anomaly.js") || h.contains("/anomaly") {
+        return Some("anomaly");
+    }
+    if h.contains("/cdn-cgi/challenge") || h.contains("challenge-platform") || h.contains("cf-chl") {
+        return Some("cloudflare");
+    }
+    if h.contains("g-recaptcha") || h.contains("recaptcha/api") || h.contains("hcaptcha") {
+        return Some("captcha");
+    }
+    if h.contains("unusual traffic") || h.contains("are you a robot") || h.contains("verify you are a human") {
+        return Some("captcha");
+    }
+    None
+}
+
+/// Classify one engine fetch into (hits, status) where status is one of
+/// `ok:<n>` / `empty` / `blocked:<reason>` / `timeout`.
+fn classify(resp: Option<(u16, String)>, parse: impl Fn(&str) -> Vec<SearchHit>) -> (Vec<SearchHit>, String) {
+    match resp {
+        None => (Vec::new(), "timeout".into()),
+        Some((status, body)) => {
+            if status != 200 {
+                return (Vec::new(), format!("blocked:http{status}"));
+            }
+            if let Some(reason) = detect_block(&body) {
+                return (Vec::new(), format!("blocked:{reason}"));
+            }
+            let hits = parse(&body);
+            if hits.is_empty() {
+                (Vec::new(), "empty".into())
+            } else {
+                let n = hits.len();
+                (hits, format!("ok:{n}"))
+            }
+        }
+    }
 }
 
 // ── ranking ─────────────────────────────────────────────────────────────────
@@ -240,7 +328,7 @@ pub(crate) async fn search_run(
     site: Option<&str>,
     exclude_sites: Option<&[String]>,
     freshness: Option<&str>,
-) -> anyhow::Result<Vec<SearchHit>> {
+) -> anyhow::Result<(Vec<SearchHit>, Vec<String>)> {
     let max_results = max_results.clamp(1, 20);
     let client = fetcher::client();
 
@@ -269,22 +357,57 @@ pub(crate) async fn search_run(
     let ddg_url = format!("https://html.duckduckgo.com/html/?q={q}");
     let bing_url = format!("https://www.bing.com/search?q={q}");
     let mojeek_url = format!("https://www.mojeek.com/search?q={q}");
+    let brave_url = format!("https://search.brave.com/search?q={q}&source=web");
 
+    // Fetch returns (status, body) so the caller can distinguish a 202/403 wall
+    // from a 200 captcha page from a timeout.
     let fetch = |url: String| async move {
         let fut = async {
             let resp = client.get(&url).send().await.ok()?;
-            resp.text().await.ok()
+            let status = resp.status().as_u16();
+            let body = resp.text().await.ok()?;
+            Some((status, body))
         };
         tokio::time::timeout(ENGINE_TIMEOUT, fut).await.ok().flatten()
     };
-    let (ddg, bing, mojeek) = tokio::join!(fetch(ddg_url), fetch(bing_url), fetch(mojeek_url));
+    let (ddg, bing, mojeek, brave) =
+        tokio::join!(fetch(ddg_url), fetch(bing_url), fetch(mojeek_url), fetch(brave_url));
 
-    let ddg_hits = ddg.map(|h| parse_ddg(&h)).unwrap_or_default();
-    let bing_hits = bing.map(|h| parse_bing(&h)).unwrap_or_default();
-    let mojeek_hits = mojeek.map(|h| parse_mojeek(&h)).unwrap_or_default();
+    // DDG: if the main html endpoint is blocked/empty/timed out, retry once via
+    // the lite endpoint before giving up on DuckDuckGo entirely.
+    let (ddg_hits, ddg_status) = {
+        let (hits, status) = classify(ddg, parse_ddg);
+        if status.starts_with("ok") {
+            (hits, format!("ddg:{status}"))
+        } else {
+            let lite_url = format!("https://lite.duckduckgo.com/lite/?q={q}");
+            let (lhits, lstatus) = classify(fetch(lite_url).await, parse_ddg_lite);
+            if lstatus.starts_with("ok") {
+                (lhits, format!("ddg-lite:{lstatus}"))
+            } else {
+                (hits, format!("ddg:{status}"))
+            }
+        }
+    };
+    let (bing_hits, bing_status) = classify(bing, parse_bing);
+    let (brave_hits, brave_status) = classify(brave, parse_brave);
+    let (mojeek_hits, mojeek_status) = classify(mojeek, parse_mojeek);
+
+    let engines = vec![
+        ddg_status.clone(),
+        format!("bing:{bing_status}"),
+        format!("brave:{brave_status}"),
+        format!("mojeek:{mojeek_status}"),
+    ];
+    // Every engine failed (none returned ok) — surface the block, don't lie
+    // "no results".
+    let any_ok = ddg_status.contains(":ok:") || bing_status.starts_with("ok") || brave_status.starts_with("ok") || mojeek_status.starts_with("ok");
+    if !any_ok {
+        anyhow::bail!("all search engines failed: [{}]", engines.join(", "));
+    }
 
     let terms = query_terms(query);
-    let mut merged = fuse_and_rank(vec![ddg_hits, bing_hits, mojeek_hits], &terms);
+    let mut merged = fuse_and_rank(vec![ddg_hits, bing_hits, brave_hits, mojeek_hits], &terms);
 
     if let Some(s) = site {
         let s = s.trim().to_lowercase();
@@ -307,7 +430,7 @@ pub(crate) async fn search_run(
     }
 
     merged.truncate(max_results);
-    Ok(merged)
+    Ok((merged, engines))
 }
 
 // ── url encoding ────────────────────────────────────────────────────────────
@@ -395,6 +518,45 @@ mod tests {
         assert!(hits.len() >= 2, "got {}", hits.len());
         assert!(hits.iter().all(|h| !h.url.contains("bing.com")), "ck/a not decoded");
         assert!(hits.iter().any(|h| !h.snippet.is_empty()), "expected snippets");
+    }
+
+    #[test]
+    fn brave_fixture_parses() {
+        let html = include_str!("../tests/fixtures/brave.html");
+        let hits = parse_brave(html);
+        assert!(hits.len() >= 4, "got {}", hits.len());
+        assert!(hits.iter().all(|h| h.url.starts_with("http")));
+        assert!(hits.iter().all(|h| !h.url.contains("brave.com")), "internal brave link leaked");
+        assert_eq!(hits[0].url, "https://docs.rs/tokio/latest/tokio/macro.select.html");
+        assert!(hits.iter().any(|h| !h.snippet.is_empty()), "expected snippets");
+    }
+
+    #[test]
+    fn ddg_lite_fixture_parses() {
+        let html = include_str!("../tests/fixtures/ddglite.html");
+        let hits = parse_ddg_lite(html);
+        assert_eq!(hits.len(), 3, "got {}", hits.len());
+        // uddg redirect must be decoded to the real target.
+        assert_eq!(hits[0].url, "https://docs.rs/tokio/latest/tokio/macro.select.html");
+        assert!(hits.iter().all(|h| !h.url.contains("duckduckgo.com")), "redirect not resolved");
+        assert!(hits.iter().all(|h| !h.snippet.is_empty()), "expected snippets");
+    }
+
+    #[test]
+    fn block_detection() {
+        let blocked = include_str!("../tests/fixtures/ddglite_blocked.html");
+        assert_eq!(detect_block(blocked), Some("anomaly"));
+        // Real result pages are not flagged.
+        assert_eq!(detect_block(include_str!("../tests/fixtures/brave.html")), None);
+        assert_eq!(detect_block(include_str!("../tests/fixtures/ddglite.html")), None);
+        // Status-based classification.
+        assert_eq!(classify(None, parse_brave).1, "timeout");
+        assert_eq!(classify(Some((202, String::new())), parse_brave).1, "blocked:http202");
+        assert_eq!(classify(Some((200, blocked.to_string())), parse_ddg_lite).1, "blocked:anomaly");
+        assert_eq!(classify(Some((200, "<html></html>".into())), parse_brave).1, "empty");
+        let (hits, st) = classify(Some((200, include_str!("../tests/fixtures/ddglite.html").to_string())), parse_ddg_lite);
+        assert_eq!(st, "ok:3");
+        assert_eq!(hits.len(), 3);
     }
 
     #[test]
