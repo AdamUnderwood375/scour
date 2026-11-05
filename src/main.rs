@@ -347,7 +347,7 @@ impl Scour {
         Parameters(req): Parameters<SearchRequest>,
     ) -> Result<Json<SearchResult>, ErrorData> {
         let max = req.max_results.unwrap_or(10).clamp(1, 20);
-        let hits = search_run(
+        let (hits, engines) = search_run(
             &req.query,
             max,
             req.site.as_deref(),
@@ -360,6 +360,7 @@ impl Scour {
             query: req.query,
             total: hits.len(),
             hits,
+            engines,
         }))
     }
 
@@ -1535,7 +1536,7 @@ async fn cmd_scrape(args: &[String]) -> anyhow::Result<()> {
 async fn cmd_search(args: &[String]) -> anyhow::Result<()> {
     let o = parse_search(args).unwrap_or_else(|e| usage(&e));
     let t0 = std::time::Instant::now();
-    let hits = search_run(&o.query, o.max, o.site.as_deref(), None, o.freshness.as_deref()).await?;
+    let (hits, engines) = search_run(&o.query, o.max, o.site.as_deref(), None, o.freshness.as_deref()).await?;
     let ms = t0.elapsed().as_millis();
     let pages = if o.fetch > 0 {
         let urls: Vec<String> = hits.iter().take(o.fetch).map(|h| h.url.clone()).collect();
@@ -1543,7 +1544,7 @@ async fn cmd_search(args: &[String]) -> anyhow::Result<()> {
     } else {
         Vec::new()
     };
-    let sr = SearchResult { query: o.query.clone(), total: hits.len(), hits };
+    let sr = SearchResult { query: o.query.clone(), total: hits.len(), hits, engines };
     if o.json {
         let mut v = serde_json::to_value(&sr)?;
         if o.fetch > 0 {
@@ -1565,7 +1566,7 @@ async fn cmd_search(args: &[String]) -> anyhow::Result<()> {
     }
     if o.stats {
         print_item_stats(&pages);
-        eprintln!("stats: {}", serde_json::json!({"op":"search","query":&o.query,"hits":sr.total,"ms":ms}));
+        eprintln!("stats: {}", serde_json::json!({"op":"search","query":&o.query,"hits":sr.total,"ms":ms,"engines":&sr.engines}));
     }
     Ok(())
 }
