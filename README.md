@@ -10,7 +10,7 @@ Fast, local, Rust-only web scraper: single pages, batch fetches, site crawls, an
 
 ## What it is
 
-`scour` is one small Rust binary (~2,230 lines across `src/main.rs`, `src/fetcher.rs`, `src/cache.rs`, `src/extractor.rs`, edition 2024, MIT) that turns messy web pages into clean markdown for humans and agents. It fetches with plain HTTP when that works, escalates to a headless browser only when blocked, extracts the readable content, and optionally filters long documents down to the paragraphs that match your query.
+`scour` is one small Rust binary (~4,300 lines across `src/`, edition 2024, MIT) that turns messy web pages into clean markdown for humans and agents. It fetches with plain HTTP when that works, escalates to a headless browser only when blocked, extracts the readable content, and optionally filters long documents down to the paragraphs that match your query.
 
 ```mermaid
 flowchart LR
@@ -53,7 +53,7 @@ Install it by copying `skills/scour/SKILL.md` into the agent's skills directory 
 - **Single-page scraping** — clean markdown plus title, description, headings, links, and images.
 - **Batch scraping** — up to 10 URLs in parallel via `scrape_batch`.
 - **Site crawling** — same-domain, best-first focus-aware BFS returning markdown per page plus the link graph.
-- **Keyless web search** — DuckDuckGo HTML + Bing in parallel, deduped and ranked; supports `site:`, freshness, and `exclude_sites` filters.
+- **Keyless web search** — DuckDuckGo, Bing, Brave and Mojeek in parallel, deduped and ranked; supports `site:`, freshness, and `exclude_sites` filters.
 - **Readability-first extraction** — articles via readability, list/index pages (HN, Reddit, search results) via a trafilatura-style fallback.
 - **BM25 focus** — a query keeps only the relevant paragraphs of a long document.
 - **Two-tier fetching** — ~300 ms plain HTTP first, ~3.5 s headless browser only when blocked.
@@ -87,7 +87,7 @@ The release build output lands at `./target/release/scour`.
 
 ```sh
 scour <url> [focus...] [flags]              # scrape one page (same as `scrape`)
-scour scrape <url> [focus...] [--max-chars N] [--offset N] [--json] [--stats]
+scour scrape <url> [focus...] [--focus Q] [--max-chars N] [--offset N] [--json] [--stats]
 scour batch [urls...] [--focus Q] [--max-chars N] [--parallel N] [--json] [--stats]   # URLs from stdin if none
 scour search <query...> [--max N] [--site D] [--freshness day|week|month|year] [--fetch N] [--focus Q] [--json] [--stats]
 scour gh <owner/repo|github-url>...         # stars, license, latest release
@@ -111,11 +111,11 @@ Defaults: `--max-chars 6000` for `scrape`/`batch`; `--fetch` pages and `crawl` p
 
 Stdout is markdown (`# title` + meta comment for `scrape`, `## <url>` sections for `batch`/`search --fetch`/`crawl`). Stderr carries warnings and `next_offset`; `--stats` adds one JSON `stats:` line per fetch. `--json` prints the result struct as JSON instead (batch and `search --fetch` emit an array / a `pages` key; failed fetches become `{url, content_ok:false, error}`).
 
-When output is cut short it ends with `<!-- truncated: rerun with --offset N for more -->`; rerun `scour scrape <url> --offset N` to continue. The focus query is often a better first move than paging through a long page: BM25 keeps the relevant paragraphs.
+When output is cut short it ends with a `<!-- truncated at N of T chars; more: scour scrape '<url>' --offset N ... -->` comment; paste that command to continue (it repeats the focus and max-chars, so the offset lines up). The focus query is often a better first move than paging through a long page: BM25 keeps the relevant paragraphs.
 
 `links` lists every `<a href>` on the page (nav and sidebar included), one `text — url` per line, deduped. `--filter` is a case-insensitive substring match on the URL or text.
 
-Errors print `error: ...` and exit non-zero; bad flags exit 2 with usage. With no arguments the binary runs as a stdio MCP server instead:
+Errors print `error: ...` and exit non-zero; bad flags exit 2 with usage. `gh`/`pkg` exit 1 if any lookup failed; `batch` and `search --fetch` exit 1 only when every page failed. `--max-chars` must be at least 1. With no arguments the binary runs as a stdio MCP server instead:
 
 ```sh
 ./target/release/scour
@@ -211,7 +211,7 @@ Field notes: `tier` records which fetch tier served the page; `blocked` / `conte
 
 ## Development and CI
 
-Stack: Rust edition 2024 with `ammonia`, `anyhow`, `base64`, `fs2`, `futures`, `headless_chrome`, `html2md`, `lru`, `readability`, `reqwest` 0.13 (rustls, charset, http2, gzip, brotli, cookies), `rmcp` 3.1 (server + stdio transport), `schemars`, `scraper` 0.24, `serde`/`serde_json`, `tokio`, `url`. 19 unit tests total (`main` 10, `fetcher` 4, `extractor` 3, `cache` 2).
+Stack: Rust edition 2024 with `ammonia`, `anyhow`, `base64`, `fs2`, `futures`, `headless_chrome`, `html2md`, `lru`, `readability`, `reqwest` 0.13 (rustls, charset, http2, gzip, brotli, cookies), `rmcp` 3.1 (server + stdio transport), `schemars`, `scraper` 0.24, `serde`/`serde_json`, `tokio`, `url`. 60 tests (56 run by default; 4 live network tests are `#[ignore]`d): `main` 23, `tools` 14, `search` 10, `fetcher` 8, `extractor` 3, `cache` 2.
 
 ```sh
 cargo test
