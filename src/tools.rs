@@ -21,8 +21,7 @@ const CRATES_UA: &str = concat!(
 /// Compact GitHub repo summary. `spec` is `owner/repo` or any github.com URL.
 pub async fn gh(spec: &str) -> Result<String> {
     let (owner, repo) = parse_gh_spec(spec)?;
-    let what = format!("{owner}/{repo}");
-    let base = format!("https://api.github.com/repos/{what}");
+    let base = format!("https://api.github.com/repos/{owner}/{repo}");
     let auth = std::env::var("GITHUB_TOKEN")
         .ok()
         .filter(|t| !t.is_empty())
@@ -35,34 +34,41 @@ pub async fn gh(spec: &str) -> Result<String> {
         headers.push(("Authorization", a.as_str()));
     }
 
-    let rel_url = format!("{base}/releases/latest");
-    let (repo_res, rel_res) = tokio::join!(get(&base, &headers), get(&rel_url, &headers));
+    // Only the repo call is fatal; release lookup failures just drop the line.
+    let (repo_res, release) =
+        tokio::join!(get(&base, &headers), latest_release(&base, &headers));
 
     let (st, body) = repo_res?;
     if !st.is_success() {
-        return Err(http_err("GitHub", st, &what));
+        return Err(http_err("GitHub", st));
     }
     let repo_json = json_of(&body, &base)?;
+    Ok(format_gh(&repo_json, release.as_ref().map(|r| r.as_ref())))
+}
 
-    let (rst, rbody) = rel_res?;
-    let release = if rst.is_success() {
-        Some(json_of(&rbody, &rel_url)?)
-    } else if rst == StatusCode::NOT_FOUND {
-        // No releases: fall back to the newest tag (name only, no date).
-        let tags_url = format!("{base}/tags?per_page=1");
-        let (tst, tbody) = get(&tags_url, &headers).await?;
-        if !tst.is_success() {
-            return Err(http_err("GitHub", tst, &what));
-        }
-        json_of(&tbody, &tags_url)?
-            .get(0)
+/// Latest release, else newest tag (name only). Outer `None` = lookup failed;
+/// `Some(None)` = repo has neither.
+async fn latest_release(base: &str, headers: &[(&str, &str)]) -> Option<Option<Value>> {
+    let rel_url = format!("{base}/releases/latest");
+    let release = get(&rel_url, headers)
+        .await
+        .ok()
+        .filter(|(st, _)| st.is_success())
+        .and_then(|(_, body)| json_of(&body, &rel_url).ok());
+    if let Some(v) = release {
+        return Some(Some(v));
+    }
+    let tags_url = format!("{base}/tags?per_page=1");
+    let (st, body) = get(&tags_url, headers).await.ok()?;
+    if !st.is_success() {
+        return None;
+    }
+    let tags = json_of(&body, &tags_url).ok()?;
+    Some(
+        tags.get(0)
             .and_then(|t| s(t, "name"))
-            .map(|n| json!({ "tag_name": n }))
-    } else {
-        return Err(http_err("GitHub", rst, &what));
-    };
-
-    Ok(format_gh(&repo_json, release.as_ref()))
+            .map(|n| json!({ "tag_name": n })),
+    )
 }
 
 /// Latest version of a package. `registry` is crates | npm | pypi (aliases ok).
@@ -75,17 +81,17 @@ pub async fn pkg(registry: &str, name: &str) -> Result<String> {
     match registry.trim().to_ascii_lowercase().as_str() {
         "crates" | "crate" | "crates.io" => {
             let url = format!("https://crates.io/api/v1/crates/{enc_name}");
-            let v = fetch_json("crates.io", name, &url, &[("User-Agent", CRATES_UA)]).await?;
+            let v = fetch_json("crates.io", &url, &[("User-Agent", CRATES_UA)]).await?;
             Ok(format_crate(&v))
         }
         "npm" | "npmjs" => {
             let url = format!("https://registry.npmjs.org/{enc_name}");
-            let v = fetch_json("npm", name, &url, &[]).await?;
+            let v = fetch_json("npm", &url, &[]).await?;
             Ok(format_npm(&v))
         }
         "pypi" | "pip" => {
             let url = format!("https://pypi.org/pypi/{enc_name}/json");
-            let v = fetch_json("PyPI", name, &url, &[]).await?;
+            let v = fetch_json("PyPI", &url, &[]).await?;
             Ok(format_pypi(&v))
         }
         _ => bail!(
@@ -109,10 +115,10 @@ async fn get(url: &str, headers: &[(&str, &str)]) -> Result<(StatusCode, String)
     Ok((status, resp.text().await?))
 }
 
-async fn fetch_json(svc: &str, what: &str, url: &str, headers: &[(&str, &str)]) -> Result<Value> {
+async fn fetch_json(svc: &str, url: &str, headers: &[(&str, &str)]) -> Result<Value> {
     let (status, body) = get(url, headers).await?;
     if !status.is_success() {
-        return Err(http_err(svc, status, what));
+        return Err(http_err(svc, status));
     }
     json_of(&body, url)
 }
@@ -121,13 +127,14 @@ fn json_of(body: &str, url: &str) -> Result<Value> {
     serde_json::from_str(body).with_context(|| format!("invalid JSON from {url}"))
 }
 
-fn http_err(svc: &str, status: StatusCode, what: &str) -> anyhow::Error {
+// No spec in the message: print_lookups already prefixes it as `error: <spec>: …`.
+fn http_err(svc: &str, status: StatusCode) -> anyhow::Error {
     match status.as_u16() {
-        404 => anyhow!("{what} not found on {svc}"),
+        404 => anyhow!("not found on {svc}"),
         403 if svc == "GitHub" => {
-            anyhow!("GitHub API 403 for {what}: rate limited — set GITHUB_TOKEN to raise the limit")
+            anyhow!("GitHub API 403: rate limited — set GITHUB_TOKEN to raise the limit")
         }
-        _ => anyhow!("{svc} returned HTTP {status} for {what}"),
+        _ => anyhow!("{svc} returned HTTP {status}"),
     }
 }
 
@@ -174,7 +181,8 @@ fn valid_gh_part(p: &str) -> bool {
             .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.'))
 }
 
-pub fn format_gh(repo: &Value, release: Option<&Value>) -> String {
+/// `release`: `None` = lookup failed (line omitted); `Some(None)` = no release or tag.
+pub fn format_gh(repo: &Value, release: Option<Option<&Value>>) -> String {
     let mut out = vec![format!("# {}", s(repo, "full_name").unwrap_or("?"))];
     out.extend(s(repo, "description").map(String::from));
     out.push(format!(
@@ -191,13 +199,15 @@ pub fn format_gh(repo: &Value, release: Option<&Value>) -> String {
         s(repo, "default_branch").unwrap_or("?"),
         s(repo, "pushed_at").map_or("?", date)
     ));
-    out.push(
-        match release.and_then(|r| s(r, "tag_name").map(|t| (t, s(r, "published_at")))) {
-            Some((tag, Some(at))) => format!("Latest release: {tag} ({})", date(at)),
-            Some((tag, None)) => format!("Latest tag: {tag}"),
-            None => "Latest release: none".to_string(),
-        },
-    );
+    if let Some(release) = release {
+        out.push(
+            match release.and_then(|r| s(r, "tag_name").map(|t| (t, s(r, "published_at")))) {
+                Some((tag, Some(at))) => format!("Latest release: {tag} ({})", date(at)),
+                Some((tag, None)) => format!("Latest tag: {tag}"),
+                None => "Latest release: none".to_string(),
+            },
+        );
+    }
     if let Some(h) = s(repo, "homepage") {
         out.push(format!("Homepage: {h}"));
     }
@@ -228,12 +238,14 @@ pub fn format_crate(v: &Value) -> String {
         num(c, "downloads"),
         num(c, "recent_downloads")
     ));
+    out.extend(s(c, "name").map(|n| format!("Registry: https://crates.io/crates/{n}")));
     if let Some(r) = s(c, "repository") {
         out.push(format!("Repository: {r}"));
     }
-    if let Some(d) = s(c, "documentation") {
-        out.push(format!("Docs: {d}"));
-    }
+    let docs = s(c, "documentation")
+        .map(String::from)
+        .or_else(|| s(c, "name").map(|n| format!("https://docs.rs/{n}")));
+    out.extend(docs.map(|d| format!("Docs: {d}")));
     out.join("\n")
 }
 
@@ -246,6 +258,7 @@ pub fn format_npm(v: &Value) -> String {
         "Published: {} · License: {license}",
         s(&v["time"], ver).map_or("?", date)
     ));
+    out.extend(s(v, "name").map(|n| format!("Registry: https://www.npmjs.com/package/{n}")));
     let repo = s(v, "repository").or(s(&v["repository"], "url"));
     if let Some(r) = repo {
         let clean = r.strip_prefix("git+").unwrap_or(r);
@@ -271,6 +284,7 @@ pub fn format_pypi(v: &Value) -> String {
         "Released: {uploaded} · Requires Python: {}",
         s(info, "requires_python").unwrap_or("any")
     ));
+    out.extend(s(info, "name").map(|n| format!("Registry: https://pypi.org/project/{n}/")));
     if let Some(urls) = info["project_urls"].as_object() {
         let is_pref = |k: &str| {
             let k = k.to_ascii_lowercase();
@@ -351,7 +365,7 @@ mod tests {
             "html_url": "https://github.com/tokio-rs/axum"
         });
         let rel = json!({"tag_name": "axum-v0.8.4", "published_at": "2025-04-02T10:00:00Z"});
-        let out = format_gh(&repo, Some(&rel));
+        let out = format_gh(&repo, Some(Some(&rel)));
         assert!(out.starts_with("# tokio-rs/axum\nErgonomic web framework\n"));
         assert!(out.contains("Stars: 20000 · Forks: 1500 · Open issues: 80"));
         assert!(out.contains("License: MIT · Default branch: main · Last push: 2025-05-01"));
@@ -372,11 +386,21 @@ mod tests {
             "homepage": "", "topics": []
         });
         let tag = json!({"tag_name": "v0.1.0"});
-        let out = format_gh(&repo, Some(&tag));
+        let out = format_gh(&repo, Some(Some(&tag)));
         assert!(out.contains("License: none"));
         assert!(out.contains("Latest tag: v0.1.0"));
         assert!(!out.contains("Homepage") && !out.contains("Topics") && !out.contains("URL"));
-        assert!(format_gh(&repo, None).contains("Latest release: none"));
+        assert!(format_gh(&repo, Some(None)).contains("Latest release: none"));
+        // Failed release+tag lookup: line omitted entirely.
+        assert!(!format_gh(&repo, None).contains("Latest"));
+    }
+
+    #[test]
+    fn http_errors_do_not_repeat_spec() {
+        let e = http_err("GitHub", StatusCode::NOT_FOUND).to_string();
+        assert_eq!(e, "not found on GitHub");
+        let e = http_err("crates.io", StatusCode::BAD_GATEWAY).to_string();
+        assert_eq!(e, "crates.io returned HTTP 502 Bad Gateway");
     }
 
     #[test]
@@ -393,8 +417,17 @@ mod tests {
             out,
             "# axum 0.8.4\nWeb framework\n\
              Updated: 2025-04-02 · Downloads: 50000000 total, 9000000 last 90 days\n\
+             Registry: https://crates.io/crates/axum\n\
              Repository: https://github.com/tokio-rs/axum\nDocs: https://docs.rs/axum"
         );
+    }
+
+    #[test]
+    fn crate_docs_fallback_to_docs_rs() {
+        let v = json!({"crate": {"name": "foo-bar", "max_version": "1.0.0", "documentation": null}});
+        let out = format_crate(&v);
+        assert!(out.contains("Registry: https://crates.io/crates/foo-bar"));
+        assert!(out.contains("Docs: https://docs.rs/foo-bar"));
     }
 
     #[test]
@@ -418,6 +451,7 @@ mod tests {
             format_npm(&v),
             "# react 19.1.0\nReact is a JavaScript library\n\
              Published: 2025-03-28 · License: MIT\n\
+             Registry: https://www.npmjs.com/package/react\n\
              Repository: https://github.com/facebook/react\nHomepage: https://react.dev/"
         );
     }
@@ -440,6 +474,7 @@ mod tests {
         let out = format_pypi(&v);
         assert!(out.starts_with("# requests 2.32.3\nPython HTTP for Humans.\n"));
         assert!(out.contains("Released: 2024-05-29 · Requires Python: >=3.8"));
+        assert!(out.contains("Registry: https://pypi.org/project/requests/"));
         assert!(out.contains("Homepage: https://requests.readthedocs.io"));
         assert!(out.contains("Source: https://github.com/psf/requests"));
         assert!(!out.contains("Changelog") && !out.contains("Documentation:"));
