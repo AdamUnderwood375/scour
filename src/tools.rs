@@ -20,34 +20,40 @@ const CRATES_UA: &str = concat!(
 
 /// Compact GitHub repo summary. `spec` is `owner/repo` or any github.com URL.
 pub async fn gh(spec: &str) -> Result<String> {
+    gh_with_readme(spec, false).await.map(|(summary, _)| summary)
+}
+
+/// Repo summary and, when `readme`, the cleaned README. The README is requested only after the
+/// repo call succeeds, concurrently with the release lookup. A README error goes in the second
+/// slot and never fails the summary.
+pub async fn gh_with_readme(spec: &str, readme: bool) -> Result<(String, Option<Result<String>>)> {
     let (owner, repo) = parse_gh_spec(spec)?;
     let base = format!("https://api.github.com/repos/{owner}/{repo}");
     let auth = gh_auth();
     let headers = gh_headers("application/vnd.github+json", auth.as_deref());
 
-    // Only the repo call is fatal; release lookup failures just drop the line.
-    let (repo_res, release) =
-        tokio::join!(get(&base, &headers), latest_release(&base, &headers));
-
-    let (st, body) = repo_res?;
-    if !st.is_success() {
-        return Err(http_err("GitHub", st));
+    let r = get(&base, &headers).await?;
+    if !r.status.is_success() {
+        return Err(http_err("GitHub", r.status, &r.body, r.quota_gone));
     }
-    let repo_json = json_of(&body, &base)?;
-    Ok(format_gh(&repo_json, release.as_ref().map(|r| r.as_ref())))
+    let repo_json = json_of(&r.body, &base)?;
+    let readme_fut = async {
+        if readme { Some(readme_body(&owner, &repo, auth.as_deref()).await) } else { None }
+    };
+    // Only the repo call is fatal; release lookup failures just drop the line.
+    let (release, readme_res) = tokio::join!(latest_release(&base, &headers), readme_fut);
+    Ok((format_gh(&repo_json, release.as_ref().map(|r| r.as_ref())), readme_res))
 }
 
-/// Cleaned README text (`clean_readme`) for `spec`. Raw media type, so the body is markdown.
-pub async fn gh_readme(spec: &str) -> Result<String> {
-    let (owner, repo) = parse_gh_spec(spec)?;
+/// Cleaned README (`clean_readme`). Raw media type, so the body is markdown.
+async fn readme_body(owner: &str, repo: &str, auth: Option<&str>) -> Result<String> {
     let url = format!("https://api.github.com/repos/{owner}/{repo}/readme");
-    let auth = gh_auth();
-    let headers = gh_headers("application/vnd.github.raw", auth.as_deref());
-    let (st, body) = get(&url, &headers).await?;
-    if !st.is_success() {
-        return Err(http_err("GitHub", st));
+    let headers = gh_headers("application/vnd.github.raw", auth);
+    let r = get(&url, &headers).await?;
+    if !r.status.is_success() {
+        return Err(http_err("GitHub", r.status, &r.body, r.quota_gone));
     }
-    Ok(clean_readme(&body))
+    Ok(clean_readme(&r.body))
 }
 
 fn gh_auth() -> Option<String> {
@@ -72,17 +78,17 @@ async fn latest_release(base: &str, headers: &[(&str, &str)]) -> Option<Option<V
     let release = get(&rel_url, headers)
         .await
         .ok()
-        .filter(|(st, _)| st.is_success())
-        .and_then(|(_, body)| json_of(&body, &rel_url).ok());
+        .filter(|r| r.status.is_success())
+        .and_then(|r| json_of(&r.body, &rel_url).ok());
     if let Some(v) = release {
         return Some(Some(v));
     }
     let tags_url = format!("{base}/tags?per_page=1");
-    let (st, body) = get(&tags_url, headers).await.ok()?;
-    if !st.is_success() {
+    let r = get(&tags_url, headers).await.ok()?;
+    if !r.status.is_success() {
         return None;
     }
-    let tags = json_of(&body, &tags_url).ok()?;
+    let tags = json_of(&r.body, &tags_url).ok()?;
     Some(
         tags.get(0)
             .and_then(|t| s(t, "name"))
@@ -121,25 +127,51 @@ pub async fn pkg(registry: &str, name: &str) -> Result<String> {
 
 // ---------- HTTP helpers ----------
 
-async fn get(url: &str, headers: &[(&str, &str)]) -> Result<(StatusCode, String)> {
+/// Largest response body we read (error beyond this).
+const MAX_BODY: usize = 2 * 1024 * 1024;
+
+/// Status and body, plus whether GitHub reports its request quota used up.
+struct Reply {
+    status: StatusCode,
+    body: String,
+    quota_gone: bool,
+}
+
+async fn get(url: &str, headers: &[(&str, &str)]) -> Result<Reply> {
     let mut req = client().get(url);
     for (k, v) in headers {
         req = req.header(*k, *v);
     }
-    let resp = req
+    let mut resp = req
         .send()
         .await
         .with_context(|| format!("request failed: {url}"))?;
     let status = resp.status();
-    Ok((status, resp.text().await?))
+    let quota_gone = resp
+        .headers()
+        .get("x-ratelimit-remaining")
+        .and_then(|v| v.to_str().ok())
+        == Some("0");
+    let mut buf = Vec::new();
+    while let Some(chunk) = resp.chunk().await? {
+        if buf.len() + chunk.len() > MAX_BODY {
+            bail!("response from {url} exceeds 2 MB");
+        }
+        buf.extend_from_slice(&chunk);
+    }
+    Ok(Reply {
+        status,
+        body: String::from_utf8_lossy(&buf).into_owned(),
+        quota_gone,
+    })
 }
 
 async fn fetch_json(svc: &str, url: &str, headers: &[(&str, &str)]) -> Result<Value> {
-    let (status, body) = get(url, headers).await?;
-    if !status.is_success() {
-        return Err(http_err(svc, status));
+    let r = get(url, headers).await?;
+    if !r.status.is_success() {
+        return Err(http_err(svc, r.status, &r.body, r.quota_gone));
     }
-    json_of(&body, url)
+    json_of(&r.body, url)
 }
 
 fn json_of(body: &str, url: &str) -> Result<Value> {
@@ -147,11 +179,18 @@ fn json_of(body: &str, url: &str) -> Result<Value> {
 }
 
 // No spec in the message: print_lookups already prefixes it as `error: <spec>: …`.
-fn http_err(svc: &str, status: StatusCode) -> anyhow::Error {
+fn http_err(svc: &str, status: StatusCode, body: &str, quota_gone: bool) -> anyhow::Error {
     match status.as_u16() {
         404 => anyhow!("not found on {svc}"),
+        429 if svc == "GitHub" => {
+            anyhow!("rate limited (secondary limit); set GITHUB_TOKEN")
+        }
         403 if svc == "GitHub" => {
-            anyhow!("GitHub API 403: rate limited — set GITHUB_TOKEN to raise the limit")
+            if quota_gone || body.to_ascii_lowercase().contains("rate limit") {
+                anyhow!("rate limited; set GITHUB_TOKEN")
+            } else {
+                anyhow!("access denied (403)")
+            }
         }
         _ => anyhow!("{svc} returned HTTP {status}"),
     }
@@ -200,30 +239,57 @@ fn valid_gh_part(p: &str) -> bool {
             .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.'))
 }
 
-/// Drops badge/image-only lines and HTML comments, collapses blank runs, and trims the ends.
-/// Fenced code blocks are kept verbatim (comments and badge-looking lines inside them too).
+/// Opening tags whose line is skipped up to the line holding their `>` (multi-line markup).
+const TAG_OPENERS: [&str; 4] = ["<img", "<picture", "<source", "<a "];
+
+/// Block tags READMEs wrap headings and paragraphs in; `<h1 align="center">Serde</h1>` → `Serde`.
+const WRAPPER_TAGS: [&str; 9] = ["h1", "h2", "h3", "h4", "h5", "h6", "p", "div", "center"];
+
+/// Drops badges, `[label]: url` link definitions, HTML comments, and image/tag-only markup;
+/// unwraps block tags around text; collapses blank runs and trims the ends. Fenced code blocks
+/// are kept verbatim (comments, definitions, and badge-looking lines inside them too).
 pub fn clean_readme(raw: &str) -> String {
     let mut out: Vec<String> = Vec::new();
-    // Open fence: (marker char, run length).
     let mut fence: Option<(char, usize)> = None;
     let mut in_comment = false;
+    let mut in_tag = false;
     for line in raw.lines() {
-        let t = line.trim_start();
-        let marker = t.chars().next().filter(|c| matches!(c, '`' | '~'));
-        let run = marker.map_or(0, |m| t.chars().take_while(|c| *c == m).count());
-        if let Some((fc, fl)) = fence {
-            if marker == Some(fc) && run >= fl && t[run..].trim().is_empty() {
-                fence = None;
+        let next = fence_step(fence, line);
+        if fence.is_some() || (next.is_some() && !in_comment) {
+            fence = next;
+            out.push(line.to_string());
+            continue;
+        }
+        let mut line = strip_comments(line, &mut in_comment);
+        // A tag spans lines up to its `>`; a blank line ends it, so a stray `<a ` can't eat a README.
+        if in_tag && line.trim().is_empty() {
+            in_tag = false;
+        }
+        if in_tag {
+            let Some(i) = line.find('>') else { continue };
+            in_tag = false;
+            line = line[i + 1..].to_string();
+        } else {
+            let t = line.trim_start();
+            if !t.contains('>') && TAG_OPENERS.iter().any(|p| t.starts_with(p)) {
+                in_tag = true;
+                continue;
             }
-            out.push(line.to_string());
+        }
+        if is_link_def(&line) {
             continue;
         }
-        if let Some(m) = marker.filter(|_| run >= 3 && !in_comment) {
-            fence = Some((m, run));
-            out.push(line.to_string());
-            continue;
-        }
-        let line = strip_comments(line, &mut in_comment);
+        let stripped = strip_badges(&line);
+        let line = if stripped != line {
+            // Only punctuation left (or nothing): the line was a badge row, drop it.
+            if !stripped.chars().any(char::is_alphanumeric) {
+                continue;
+            }
+            stripped.trim().to_string()
+        } else {
+            line
+        };
+        let line = unwrap_wrapper(&line);
         if is_markup_line(&line) {
             continue;
         }
@@ -236,6 +302,101 @@ pub fn clean_readme(raw: &str) -> String {
         out.pop();
     }
     out.join("\n")
+}
+
+/// Fence state after `line`: the open fence's (marker char, run length), or None when closed.
+/// Shared by the README cleaner and the paragraph splitter, so both agree on what is code.
+pub fn fence_step(open: Option<(char, usize)>, line: &str) -> Option<(char, usize)> {
+    let t = line.trim_start();
+    let marker = t.chars().next().filter(|c| matches!(c, '`' | '~'));
+    let run = marker.map_or(0, |m| t.chars().take_while(|c| *c == m).count());
+    match open {
+        Some((fc, fl)) if marker == Some(fc) && run >= fl && t[run..].trim().is_empty() => None,
+        Some(f) => Some(f),
+        None => marker.filter(|_| run >= 3).map(|m| (m, run)),
+    }
+}
+
+/// `[label]: url` reference definition (`^\s*\[[^\]]+\]:\s*\S+`).
+fn is_link_def(line: &str) -> bool {
+    let Some(rest) = line.trim_start().strip_prefix('[') else {
+        return false;
+    };
+    let Some(close) = rest.find(']') else {
+        return false;
+    };
+    close > 0
+        && rest[close + 1..]
+            .strip_prefix(':')
+            .is_some_and(|v| !v.trim_start().is_empty())
+}
+
+/// Removes badges from a line: linked `[![alt](src)](href)` / `[![alt]][ref]` and reference
+/// images `![alt][ref]`. Other inline images and link text stay as written.
+fn strip_badges(line: &str) -> String {
+    let mut out = String::with_capacity(line.len());
+    let mut rest = line;
+    while let Some(c) = rest.chars().next() {
+        match badge_len(rest) {
+            Some(n) => rest = &rest[n..],
+            None => {
+                out.push(c);
+                rest = &rest[c.len_utf8()..];
+            }
+        }
+    }
+    out
+}
+
+/// Byte length of the badge at the start of `s`, if any (see `strip_badges`).
+fn badge_len(s: &str) -> Option<usize> {
+    let linked = s.starts_with('[');
+    let lead = usize::from(linked);
+    let img = s.get(lead..)?.strip_prefix("![")?;
+    let alt_end = lead + 3 + img.find(']')?;
+    let tail = group_len(&s[alt_end..]);
+    if !linked {
+        // Reference image only: `![alt][ref]`.
+        return tail.filter(|_| s[alt_end..].starts_with('[')).map(|t| alt_end + t);
+    }
+    // Linked: the image's own tail is optional (`[![alt]][ref]`), then `]` and the href tail.
+    let mut n = alt_end + tail.unwrap_or(0);
+    if !s[n..].starts_with(']') {
+        return None;
+    }
+    n += 1;
+    Some(n + group_len(&s[n..])?)
+}
+
+/// Length of the `(…)` or `[…]` group at the start of `s`.
+fn group_len(s: &str) -> Option<usize> {
+    let close = match s.as_bytes().first()? {
+        b'(' => ')',
+        b'[' => ']',
+        _ => return None,
+    };
+    Some(s.find(close)? + 1)
+}
+
+/// `<h1 align="center">Serde</h1>` → `Serde` for `WRAPPER_TAGS`; anything else passes through.
+fn unwrap_wrapper(line: &str) -> String {
+    let t = line.trim();
+    let Some(inner) = t.strip_prefix('<') else {
+        return line.to_string();
+    };
+    let name: String = inner.chars().take_while(char::is_ascii_alphanumeric).collect();
+    let name = name.to_ascii_lowercase();
+    let close = format!("</{name}>");
+    match t.find('>') {
+        Some(g)
+            if WRAPPER_TAGS.contains(&name.as_str())
+                && t.ends_with(&close)
+                && g < t.len() - close.len() =>
+        {
+            t[g + 1..t.len() - close.len()].trim().to_string()
+        }
+        _ => line.to_string(),
+    }
 }
 
 /// Removes `<!-- … -->` spans; a span may cross lines, so `in_comment` carries over.
@@ -518,10 +679,26 @@ mod tests {
 
     #[test]
     fn http_errors_do_not_repeat_spec() {
-        let e = http_err("GitHub", StatusCode::NOT_FOUND).to_string();
+        let e = http_err("GitHub", StatusCode::NOT_FOUND, "", false).to_string();
         assert_eq!(e, "not found on GitHub");
-        let e = http_err("crates.io", StatusCode::BAD_GATEWAY).to_string();
+        let e = http_err("crates.io", StatusCode::BAD_GATEWAY, "", false).to_string();
         assert_eq!(e, "crates.io returned HTTP 502 Bad Gateway");
+    }
+
+    #[test]
+    fn github_limits_get_rate_limit_hint() {
+        let e = |st, body, gone| http_err("GitHub", st, body, gone).to_string();
+        assert_eq!(
+            e(StatusCode::TOO_MANY_REQUESTS, "", false),
+            "rate limited (secondary limit); set GITHUB_TOKEN"
+        );
+        let primary = r#"{"message":"API rate limit exceeded for 1.2.3.4"}"#;
+        assert_eq!(e(StatusCode::FORBIDDEN, primary, false), "rate limited; set GITHUB_TOKEN");
+        assert_eq!(e(StatusCode::FORBIDDEN, "", true), "rate limited; set GITHUB_TOKEN");
+        assert_eq!(
+            e(StatusCode::FORBIDDEN, "Repository access blocked", false),
+            "access denied (403)"
+        );
     }
 
     #[test]
@@ -629,6 +806,53 @@ mod tests {
         assert_eq!(clean_readme("a <!-- x --> b\n<!--\n\n-->\nc\n"), "a  b\n\nc");
         assert_eq!(clean_readme("\n\n  \n"), "");
         assert_eq!(clean_readme("[![Docs](https://d/b.svg)][docs]\n\nkeep"), "keep");
+    }
+
+    #[test]
+    fn readme_cleaning_serde_fixture() {
+        let raw = concat!(
+            "<h1 align=\"center\">Serde</h1>\n\n",
+            "<p align=\"center\">\n",
+            "<img src=\"https://x/serde.svg\"\n",
+            "  width=\"50%\" alt=\"Serde\">\n",
+            "</p>\n\n",
+            "# Serde &emsp; [![Build Status]][actions] [![Latest Version]][crates]\n\n",
+            "[![Build Status]][actions] [![MIT]][license]\n\n",
+            "[Build Status]: https://img.shields.io/github/actions/workflow/status/serde-rs/serde/ci.yml\n",
+            "[actions]: https://github.com/serde-rs/serde/actions\n",
+            "[crates]: https://crates.io/crates/serde\n\n",
+            "Serde is a framework for [serializing](https://x) data.\n\n",
+            "```rust\n[Build Status]: not a def\n\n\nlet x = 1;\n```\n",
+        );
+        assert_eq!(
+            clean_readme(raw),
+            "Serde\n\n# Serde &emsp;\n\nSerde is a framework for [serializing](https://x) data.\n\n\
+             ```rust\n[Build Status]: not a def\n\n\nlet x = 1;\n```"
+        );
+    }
+
+    #[test]
+    fn readme_cleaning_multiline_tags_and_stray_openers() {
+        // A multi-line `<picture>` logo block: the `<img` spans lines and closes on `/>`.
+        let raw = "<picture>\n<source srcset=\"d.png\">\n<img\n  src=\"l.png\"\n  alt=\"logo\" />\n</picture>\nKeep";
+        assert_eq!(clean_readme(raw), "Keep");
+        // A stray `<a ` with no `>` must not swallow the rest of the README.
+        assert_eq!(clean_readme("<a href=\"x\"\n\nKeep me"), "Keep me");
+        // Punctuation-only badge rows vanish; text around a badge survives.
+        assert_eq!(clean_readme("[![a]][b] |\n\nv1 [![c]][d] ok"), "v1  ok");
+    }
+
+    #[test]
+    fn link_defs_and_reference_images() {
+        assert!(is_link_def("[x]: https://a"));
+        assert!(is_link_def("  [Some label]:https://a"));
+        assert!(!is_link_def("[x] https://a"));
+        assert!(!is_link_def("[]: empty label"));
+        assert!(!is_link_def("[x]:"));
+        assert_eq!(strip_badges("a ![alt][ref] b"), "a  b");
+        assert_eq!(strip_badges("![inline](s.png) b"), "![inline](s.png) b");
+        assert_eq!(unwrap_wrapper("<p align=\"center\">Hi</p>"), "Hi");
+        assert_eq!(unwrap_wrapper("<picture>"), "<picture>");
     }
 
     #[tokio::test]

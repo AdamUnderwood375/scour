@@ -486,16 +486,38 @@ fn validate(url: &str) -> anyhow::Result<()> {
 /// Appended when a focus query matches nothing, so the unfocused text is not silent.
 const FOCUS_MISS: &str = "<!-- focus matched nothing; unfocused page shown -->";
 
-fn focus_filter(markdown: &str, query: &str, keep: usize) -> String {
+/// Paragraphs split on blank lines, except that a fenced code block is never split: it is one
+/// paragraph even when it holds blank lines.
+fn paragraphs(md: &str) -> Vec<&str> {
+    let pieces: Vec<&str> = md.split("\n\n").collect();
+    let last = pieces.len() - 1;
+    let mut out = Vec::new();
+    let (mut start, mut end) = (0, 0);
+    let mut fence = None;
+    for (i, piece) in pieces.iter().enumerate() {
+        end += piece.len();
+        fence = piece.lines().fold(fence, tools::fence_step);
+        if fence.is_none() || i == last {
+            out.push(&md[start..end]);
+            start = end + 2;
+        }
+        end += 2;
+    }
+    out
+}
+
+/// The paragraphs most relevant to `query`, in page order. `None` when the query has no usable
+/// term or nothing matches.
+fn focus_filter(markdown: &str, query: &str, keep: usize) -> Option<String> {
     let terms: Vec<String> = query
         .split_whitespace()
         .map(|t| t.trim_matches(|c: char| !c.is_alphanumeric()).to_lowercase())
         .filter(|t| t.len() > 2)
         .collect();
     if terms.is_empty() {
-        return format!("{markdown}\n\n{FOCUS_MISS}");
+        return None;
     }
-    let paras: Vec<&str> = markdown.split("\n\n").collect();
+    let paras = paragraphs(markdown);
     let n = paras.len() as f32;
     let mut df: Vec<usize> = vec![0; terms.len()];
     let lower_paras: Vec<String> = paras.iter().map(|p| p.to_lowercase()).collect();
@@ -523,25 +545,29 @@ fn focus_filter(markdown: &str, query: &str, keep: usize) -> String {
         scored.push((score, i, *para));
     }
     if scored.is_empty() {
-        return format!("{markdown}\n\n{FOCUS_MISS}");
+        return None;
     }
     scored.sort_by(|a, b| b.0.total_cmp(&a.0));
     scored.truncate(keep);
     scored.sort_by_key(|(_, i, _)| *i);
-    scored.into_iter().map(|(_, _, p)| p).collect::<Vec<_>>().join("\n\n")
+    Some(scored.into_iter().map(|(_, _, p)| p).collect::<Vec<_>>().join("\n\n"))
 }
 
-/// The text `offset` and `max_chars` index into, and its char count. `focus` applies only when
-/// `content_ok`. A focus miss appends `FOCUS_MISS` to the text but not to the count, so the
-/// hint's "of N" counts page text only.
-fn focus_view(markdown: &str, focus: Option<&str>, content_ok: bool) -> (String, usize) {
-    let Some(q) = focus.filter(|_| content_ok) else {
-        return (markdown.to_string(), markdown.chars().count());
-    };
-    let text = focus_filter(markdown, q, 40);
-    let marker = format!("\n\n{FOCUS_MISS}");
-    let n = text.strip_suffix(marker.as_str()).unwrap_or(text.as_str()).chars().count();
-    (text, n)
+/// The text `offset` and `max_chars` index into, its char count, and whether `focus` matched
+/// nothing (then the unfocused text is returned). `focus` applies only when `content_ok`. The
+/// caller appends `FOCUS_MISS` after cutting (`cut_page`), so the note is never truncated away.
+fn focus_view(markdown: &str, focus: Option<&str>, content_ok: bool) -> (String, usize, bool) {
+    let n = markdown.chars().count();
+    match focus.filter(|_| content_ok) {
+        None => (markdown.to_string(), n, false),
+        Some(q) => match focus_filter(markdown, q, 40) {
+            Some(text) => {
+                let n = text.chars().count();
+                (text, n, false)
+            }
+            None => (markdown.to_string(), n, true),
+        },
+    }
 }
 
 /// Cuts `md` to at most `limit` chars (minimum 1, so paging always advances), preferring a
@@ -553,6 +579,27 @@ fn truncate(md: &str, limit: usize) -> (String, bool) {
     // `end` is a char boundary, so the slice never splits a codepoint.
     let cut = md[..end].rfind("\n\n").filter(|b| *b > end / 2).unwrap_or(end);
     (md[..cut].to_string(), true)
+}
+
+/// Closes a fenced code block that a cut left open, so the kept markdown stays balanced.
+fn close_fence(md: &str) -> String {
+    match md.lines().fold(None, tools::fence_step) {
+        Some((c, n)) => format!("{}\n{}", md.trim_end_matches('\n'), c.to_string().repeat(n)),
+        None => md.to_string(),
+    }
+}
+
+/// Cuts one page of output (`text` already sliced at `offset`) to `max_chars`. Returns the
+/// markdown and the next offset when cut. A cut inside a code fence is closed, and the focus-miss
+/// note goes last, after any cut, so it always shows.
+fn cut_page(text: &str, missed: bool, offset: usize, max_chars: usize) -> (String, Option<usize>) {
+    let (cut, truncated) = truncate(text, max_chars);
+    let next_offset = truncated.then(|| offset + cut.chars().count());
+    let mut md = if truncated { close_fence(&cut) } else { cut };
+    if missed {
+        md = format!("{md}\n\n{FOCUS_MISS}");
+    }
+    (md, next_offset)
 }
 
 fn extract_headings(markdown: &str) -> Vec<String> {
@@ -662,10 +709,10 @@ async fn pdf_result(url: &str, bytes: Vec<u8>, pages: Option<&str>, focus: Optio
     let text = text.trim();
     let total_chars = text.chars().count();
     let content_ok = total_chars > 20;
-    let (focused, focused_chars) = focus_view(text, focus, content_ok);
+    let (focused, focused_chars, missed) = focus_view(text, focus, content_ok);
     let off = offset.unwrap_or(0);
-    let (markdown, truncated) = truncate(&slice_at_offset(&focused, off), max_chars);
-    let next_offset = truncated.then(|| off + markdown.chars().count());
+    let (markdown, next_offset) = cut_page(&slice_at_offset(&focused, off), missed, off, max_chars);
+    let truncated = next_offset.is_some();
     let (note, next_action) = if content_ok {
         (pages.map(|p| format!("pages={p} not applied; whole PDF text returned")), None)
     } else {
@@ -906,17 +953,17 @@ async fn run_ext_stats(
     };
 
     let total_chars = doc.markdown.chars().count();
-    let (focused, focused_chars) = focus_view(&doc.markdown, focus, content_ok);
-    // Paragraphs removed by focus_filter: total minus what survived (both split on "\n\n").
+    let (focused, focused_chars, missed) = focus_view(&doc.markdown, focus, content_ok);
+    // Paragraphs removed by focus_filter: total minus what survived.
     let dropped_paras = if focus.is_some() && content_ok {
-        doc.markdown.split("\n\n").count().saturating_sub(focused.split("\n\n").count())
+        paragraphs(&doc.markdown).len().saturating_sub(paragraphs(&focused).len())
     } else {
         0
     };
     // `offset` indexes the focused text, so the hint needs its length, not the page's.
     let off = offset.unwrap_or(0);
-    let (markdown, truncated) = truncate(&slice_at_offset(&focused, off), max_chars);
-    let next_offset = truncated.then(|| off + markdown.chars().count());
+    let (markdown, next_offset) = cut_page(&slice_at_offset(&focused, off), missed, off, max_chars);
+    let truncated = next_offset.is_some();
 
     let links: Vec<LinkOut> = if include_links {
         doc.links.into_iter().take(50).map(|l| LinkOut { href: l.href, text: l.text }).collect()
@@ -1811,31 +1858,41 @@ async fn cmd_gh(args: &[String]) -> anyhow::Result<()> {
         usage("gh needs at least one owner/repo or github URL");
     }
     let o = &o;
-    let res = futures::future::join_all(specs.iter().map(|s| async move {
-        if !o.readme {
-            return tools::gh(s).await;
-        }
-        // README failure is reported inline; only the repo lookup decides success.
-        let (repo, readme) = tokio::join!(tools::gh(s), tools::gh_readme(s));
-        let excerpt = match readme {
-            Ok(text) => {
-                let text = match &o.focus {
-                    Some(q) => focus_filter(&text, q, 5),
-                    None => text,
-                };
-                let (text, cut) = truncate(&text, o.max_chars);
-                let marker = if cut { "\n\n<!-- readme truncated -->" } else { "" };
-                format!("## README (excerpt)\n{}{marker}", text.trim_end())
-            }
-            Err(e) => format!("<!-- readme unavailable: {e} -->"),
-        };
-        Ok(format!("{}\n\n{excerpt}", repo?))
-    }))
-    .await;
+    // At most 4 specs in flight: GitHub's unauthenticated quota is 60 requests/hour.
+    use futures::StreamExt;
+    let res: Vec<anyhow::Result<String>> = futures::stream::iter(specs.iter().map(|s| gh_one(s, o)))
+        .buffered(4)
+        .collect()
+        .await;
     if print_lookups(&specs, res) > 0 {
         std::process::exit(1);
     }
     Ok(())
+}
+
+/// One spec's output: repo summary, plus the README excerpt when asked. A README failure is
+/// reported inline; only the repo lookup decides success.
+async fn gh_one(spec: &str, o: &GhOpts) -> anyhow::Result<String> {
+    let (repo, readme) = tools::gh_with_readme(spec, o.readme).await?;
+    let Some(readme) = readme else {
+        return Ok(repo);
+    };
+    let excerpt = match readme {
+        Ok(text) => {
+            let (text, missed) = match &o.focus {
+                Some(q) => match focus_filter(&text, q, 5) {
+                    Some(t) => (t, false),
+                    None => (text, true),
+                },
+                None => (text, false),
+            };
+            let (body, next) = cut_page(&text, missed, 0, o.max_chars);
+            let marker = if next.is_some() { "\n\n<!-- readme truncated -->" } else { "" };
+            format!("## README (excerpt)\n{}{marker}", body.trim_end())
+        }
+        Err(e) => format!("<!-- readme unavailable: {e} -->"),
+    };
+    Ok(format!("{repo}\n\n{excerpt}"))
 }
 
 #[derive(Debug, PartialEq)]
@@ -2163,30 +2220,75 @@ mod tests {
     #[test]
     fn focus_keeps_relevant_paras_in_order() {
         let md = "about cats and yarn\n\nunrelated filler text\n\nmore cats sleeping";
-        let out = super::focus_filter(md, "cats", 40);
+        let out = super::focus_filter(md, "cats", 40).unwrap();
         assert!(out.contains("cats and yarn") && out.contains("more cats"));
         assert!(!out.contains("unrelated filler"));
         assert!(out.find("yarn").unwrap() < out.find("sleeping").unwrap());
-        assert_eq!(super::focus_filter(md, "zebra", 40), format!("{md}\n\n{}", super::FOCUS_MISS));
+        assert_eq!(super::focus_filter(md, "zebra", 40), None);
     }
 
     #[test]
-    fn focus_view_counts_page_text_not_marker() {
+    fn paragraphs_never_split_a_fence() {
+        let p = super::paragraphs;
+        assert_eq!(p("a\n\nb"), vec!["a", "b"]);
+        assert_eq!(p(""), vec![""]);
+        assert_eq!(
+            p("a\n\n```\nx\n\ny\n```\n\nb"),
+            vec!["a", "```\nx\n\ny\n```", "b"]
+        );
+        // Unclosed fence swallows the rest of the page as one paragraph.
+        assert_eq!(p("a\n\n```\nx\n\ny"), vec!["a", "```\nx\n\ny"]);
+    }
+
+    #[test]
+    fn focus_keeps_fenced_block_whole() {
+        let md = "intro\n\n```rust\nfn cats() {}\n\nlet x = 1;\n```\n\nmore";
+        // keep=1 picks the code block; splitting it on its blank line would leave a lone fence.
+        assert_eq!(
+            super::focus_filter(md, "cats", 1).unwrap(),
+            "```rust\nfn cats() {}\n\nlet x = 1;\n```"
+        );
+    }
+
+    #[test]
+    fn focus_view_counts_page_text_and_flags_miss() {
         let md = "about cats\n\nunrelated filler";
-        let (text, n) = super::focus_view(md, Some("cats"), true);
-        assert!(!text.contains("unrelated"));
+        let (text, n, missed) = super::focus_view(md, Some("cats"), true);
+        assert!(!text.contains("unrelated") && !missed);
         assert_eq!(n, text.chars().count());
-        let (miss, n) = super::focus_view(md, Some("zebra"), true);
-        assert!(miss.ends_with(super::FOCUS_MISS));
+        let (text, n, missed) = super::focus_view(md, Some("zebra"), true);
+        assert!(missed && !text.contains(super::FOCUS_MISS));
         assert_eq!(n, md.chars().count());
-        // Focus is ignored for unusable content (no marker either).
-        assert_eq!(super::focus_view(md, Some("cats"), false), (md.to_string(), md.chars().count()));
+        // Focus is ignored for unusable content.
+        assert_eq!(super::focus_view(md, Some("cats"), false), (md.to_string(), md.chars().count(), false));
+    }
+
+    #[test]
+    fn cut_closes_fence_and_keeps_miss_note_last() {
+        let md = "```rust\nlet a = 1;\n\nlet b = 2;\nlet c = 3;\n```";
+        // The cut lands inside the fence at the blank line after `let a = 1;`.
+        let (out, next) = super::cut_page(md, true, 0, 25);
+        assert_eq!(out, format!("```rust\nlet a = 1;\n```\n\n{}", super::FOCUS_MISS));
+        assert_eq!(next, Some(18));
+        assert_eq!(out.matches("```").count() % 2, 0);
+        // No cut: text untouched, note still appended, no offset.
+        assert_eq!(super::cut_page("abc", true, 0, 100), (format!("abc\n\n{}", super::FOCUS_MISS), None));
+        assert_eq!(super::cut_page("abc", false, 0, 100), ("abc".to_string(), None));
+    }
+
+    #[test]
+    fn cut_offset_counts_uncut_text() {
+        // The offset advances by the kept text only; the closing fence is not page text.
+        let md = "```\nxxxxxxxxxx\nyyyyyyyyyy\n```";
+        let (out, next) = super::cut_page(md, false, 0, 15);
+        assert_eq!(out, "```\nxxxxxxxxxx\n```");
+        assert_eq!(next, Some(15));
     }
 
     #[test]
     fn focus_bm25_heading_boost() {
         let md = "# Cats overview\n\nabout dogs\n\n## Cats sleeping habits\n\nmore dogs";
-        let out = super::focus_filter(md, "cats", 2);
+        let out = super::focus_filter(md, "cats", 2).unwrap();
         assert!(out.contains("Cats overview") || out.contains("Cats sleeping"));
     }
 
