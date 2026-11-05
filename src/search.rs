@@ -48,7 +48,10 @@ sel!(mojeek_snippet_sel, "p.s");
 sel!(brave_result_sel, "div[data-type=\"web\"]");
 sel!(brave_title_sel, ".search-snippet-title");
 sel!(brave_snippet_sel, ".snippet-description, .generic-snippet");
-// DDG lite is a flat table: one `a.result-link` + one `td.result-snippet` per hit.
+// DDG lite is a table: each hit is a `tr` with an `a.result-link`, followed by
+// a `tr` with a `td.result-snippet`. Walk rows so a missing snippet row doesn't
+// shift later snippets onto the wrong link.
+sel!(ddglite_row_sel, "tr");
 sel!(ddglite_link_sel, "a.result-link");
 sel!(ddglite_snippet_sel, ".result-snippet");
 
@@ -63,6 +66,20 @@ fn is_junk_url(url: &str) -> bool {
     }
     let host = url::Url::parse(url).ok().and_then(|u| u.host_str().map(|s| s.to_lowercase())).unwrap_or_default();
     host.ends_with("bing.com") || host.ends_with("duckduckgo.com") || host.ends_with("mojeek.com") || host.ends_with("brave.com") || host.is_empty()
+}
+
+/// Lowercased host of a URL, or empty when it won't parse.
+fn host_of(url: &str) -> String {
+    url::Url::parse(url).ok().and_then(|u| u.host_str().map(|s| s.to_lowercase())).unwrap_or_default()
+}
+
+/// True when `host` is `domain` or a subdomain of it. `domain` may carry a
+/// leading `www.`/dots (stripped first) so `example.com` matches `example.com`
+/// and `a.example.com` but not `notexample.com`.
+fn host_matches(host: &str, domain: &str) -> bool {
+    let d = domain.trim().to_lowercase();
+    let d = d.trim_matches('.').trim_start_matches("www.").trim_matches('.');
+    !d.is_empty() && (host == d || host.ends_with(&format!(".{d}")))
 }
 
 fn push_hit(hits: &mut Vec<SearchHit>, title: String, url: String, snippet: String) {
@@ -103,10 +120,10 @@ fn resolve_ddg_href(href: &str) -> String {
     if href.starts_with("//") {
         href = format!("https:{href}");
     }
-    if href.contains("uddg=")
-        && let Some(enc) = href.split("uddg=").nth(1).and_then(|s| s.split('&').next())
+    if let Ok(u) = url::Url::parse(&href)
+        && let Some((_, v)) = u.query_pairs().find(|(k, _)| k == "uddg")
     {
-        return urlencoding_decode(enc);
+        return v.into_owned();
     }
     href
 }
@@ -131,10 +148,13 @@ pub(crate) fn decode_bing_href(href: &str) -> String {
     if !href.contains("bing.com/ck/a") {
         return href.to_string();
     }
-    let Some(u) = href.split("u=").nth(1).and_then(|s| s.split('&').next()) else {
+    let Ok(url) = url::Url::parse(href) else {
         return href.to_string();
     };
-    let b64 = u.strip_prefix("a1").unwrap_or(u);
+    let Some((_, u)) = url.query_pairs().find(|(k, _)| k == "u") else {
+        return href.to_string();
+    };
+    let b64 = u.strip_prefix("a1").unwrap_or(&u);
     match base64::engine::general_purpose::URL_SAFE_NO_PAD.decode(b64) {
         Ok(bytes) => {
             let s = String::from_utf8_lossy(&bytes).into_owned();
@@ -173,18 +193,30 @@ pub(crate) fn parse_brave(html: &str) -> Vec<SearchHit> {
     hits
 }
 
-/// DDG lite has no result containers — links and snippets are separate table
-/// cells in document order, so zip them positionally. URLs are the same
-/// `/l/?uddg=` redirects as the main endpoint.
+/// DDG lite is a table where each hit is a link row optionally followed by a
+/// snippet row. Walk rows and attach each snippet to the link it follows, so a
+/// result lacking a snippet doesn't shift later snippets onto the wrong link.
+/// URLs are the same `/l/?uddg=` redirects as the main endpoint.
 pub(crate) fn parse_ddg_lite(html: &str) -> Vec<SearchHit> {
     let doc = scraper::Html::parse_document(html);
-    let snippets: Vec<String> = doc.select(ddglite_snippet_sel()).map(text_of).collect();
     let mut hits = Vec::new();
-    for (i, a) in doc.select(ddglite_link_sel()).enumerate() {
-        let title = text_of(a);
-        let url = resolve_ddg_href(a.value().attr("href").unwrap_or(""));
-        let snippet = snippets.get(i).cloned().unwrap_or_default();
-        push_hit(&mut hits, title, url, snippet);
+    let mut pending: Option<(String, String)> = None; // (title, url) awaiting snippet
+    for row in doc.select(ddglite_row_sel()) {
+        if let Some(a) = row.select(ddglite_link_sel()).next() {
+            if let Some((title, url)) = pending.take() {
+                push_hit(&mut hits, title, url, String::new());
+            }
+            let title = text_of(a);
+            let url = resolve_ddg_href(a.value().attr("href").unwrap_or(""));
+            pending = Some((title, url));
+        } else if let Some(snip) = row.select(ddglite_snippet_sel()).next()
+            && let Some((title, url)) = pending.take()
+        {
+            push_hit(&mut hits, title, url, text_of(snip));
+        }
+    }
+    if let Some((title, url)) = pending.take() {
+        push_hit(&mut hits, title, url, String::new());
     }
     hits
 }
@@ -305,9 +337,12 @@ fn fuse_and_rank(engine_hits: Vec<Vec<SearchHit>>, terms: &[String]) -> Vec<Sear
             }
         }
     }
-    let mut aggs: Vec<Agg> = order.into_iter().filter_map(|k| map.remove(&k)).collect();
-    aggs.sort_by(|a, b| score(a, terms).partial_cmp(&score(b, terms)).unwrap_or(std::cmp::Ordering::Equal).reverse());
-    aggs.into_iter().map(|a| a.hit).collect()
+    let aggs: Vec<Agg> = order.into_iter().filter_map(|k| map.remove(&k)).collect();
+    // Precompute each hit's score once, then sort — don't rebuild haystacks inside
+    // the comparator.
+    let mut scored: Vec<(f32, SearchHit)> = aggs.into_iter().map(|a| (score(&a, terms), a.hit)).collect();
+    scored.sort_by(|a, b| b.0.total_cmp(&a.0));
+    scored.into_iter().map(|(_, h)| h).collect()
 }
 
 /// Coverage is weighted ×10 so it strictly outranks RRF (max ~0.05/engine):
@@ -409,22 +444,17 @@ pub(crate) async fn search_run(
     let terms = query_terms(query);
     let mut merged = fuse_and_rank(vec![ddg_hits, bing_hits, brave_hits, mojeek_hits], &terms);
 
-    if let Some(s) = site {
-        let s = s.trim().to_lowercase();
-        if !s.is_empty() {
-            merged.retain(|h| {
-                let host = url::Url::parse(&h.url).ok().and_then(|u| u.host_str().map(|s| s.to_lowercase())).unwrap_or_default();
-                host.contains(&s) || h.url.to_lowercase().contains(&s)
-            });
-        }
+    if let Some(s) = site
+        && !s.trim().is_empty()
+    {
+        merged.retain(|h| host_matches(&host_of(&h.url), s));
     }
     if let Some(excludes) = exclude_sites {
-        let lowers: Vec<String> = excludes.iter().map(|e| e.trim().to_lowercase()).filter(|e| !e.is_empty()).collect();
-        if !lowers.is_empty() {
+        let domains: Vec<&String> = excludes.iter().filter(|e| !e.trim().is_empty()).collect();
+        if !domains.is_empty() {
             merged.retain(|h| {
-                let url_lower = h.url.to_lowercase();
-                let host = url::Url::parse(&h.url).ok().and_then(|u| u.host_str().map(|s| s.to_lowercase())).unwrap_or_default();
-                !lowers.iter().any(|ex| host.contains(ex) || url_lower.contains(ex))
+                let host = host_of(&h.url);
+                !domains.iter().any(|ex| host_matches(&host, ex))
             });
         }
     }
@@ -449,47 +479,17 @@ fn urlencoding(s: &str) -> String {
     out
 }
 
-/// Percent-decode into bytes, then interpret as UTF-8 (lossy). Decoding byte by
-/// byte into `char`s would mangle any multi-byte UTF-8 sequence.
-pub(crate) fn urlencoding_decode(s: &str) -> String {
-    let bytes = s.as_bytes();
-    let mut out: Vec<u8> = Vec::with_capacity(bytes.len());
-    let mut i = 0;
-    while i < bytes.len() {
-        match bytes[i] {
-            b'%' if i + 2 < bytes.len() => {
-                let hex = std::str::from_utf8(&bytes[i + 1..i + 3]).ok();
-                if let Some(b) = hex.and_then(|h| u8::from_str_radix(h, 16).ok()) {
-                    out.push(b);
-                    i += 3;
-                } else {
-                    out.push(b'%');
-                    i += 1;
-                }
-            }
-            b'+' => {
-                out.push(b' ');
-                i += 1;
-            }
-            c => {
-                out.push(c);
-                i += 1;
-            }
-        }
-    }
-    String::from_utf8_lossy(&out).into_owned()
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
-    fn utf8_decode_multibyte() {
-        // %C3%A9 = é, %E2%80%94 = em dash
-        assert_eq!(urlencoding_decode("caf%C3%A9"), "café");
-        assert_eq!(urlencoding_decode("a%E2%80%94b"), "a—b");
-        assert_eq!(urlencoding_decode("a+b%2Fc"), "a b/c");
+    fn ddg_uddg_decode_multibyte() {
+        // query_pairs percent-decodes: %C3%A9 = é.
+        assert_eq!(
+            resolve_ddg_href("//duckduckgo.com/l/?uddg=https%3A%2F%2Fex.com%2Fcaf%C3%A9&rut=x"),
+            "https://ex.com/café"
+        );
     }
 
     #[test]
@@ -540,6 +540,34 @@ mod tests {
         assert_eq!(hits[0].url, "https://docs.rs/tokio/latest/tokio/macro.select.html");
         assert!(hits.iter().all(|h| !h.url.contains("duckduckgo.com")), "redirect not resolved");
         assert!(hits.iter().all(|h| !h.snippet.is_empty()), "expected snippets");
+    }
+
+    #[test]
+    fn ddg_lite_missing_snippet_stays_aligned() {
+        // 2nd result has no snippet row; its empty snippet must not shift the 3rd
+        // result's snippet onto it.
+        let html = include_str!("../tests/fixtures/ddglite_nosnippet.html");
+        let hits = parse_ddg_lite(html);
+        assert_eq!(hits.len(), 3, "got {}", hits.len());
+        assert_eq!(hits[0].url, "https://docs.rs/tokio/latest/tokio/macro.select.html");
+        assert!(hits[0].snippet.contains("aggregates"), "got {:?}", hits[0].snippet);
+        assert_eq!(hits[1].url, "https://tokio.rs/tokio/tutorial/select");
+        assert!(hits[1].snippet.is_empty(), "2nd result should have no snippet, got {:?}", hits[1].snippet);
+        assert_eq!(hits[2].url, "https://github.com/tokio-rs/tokio");
+        assert!(hits[2].snippet.contains("reliable"), "got {:?}", hits[2].snippet);
+    }
+
+    #[test]
+    fn host_matches_suffix_not_substring() {
+        assert!(host_matches("example.com", "example.com"));
+        assert!(host_matches("a.example.com", "example.com"));
+        assert!(host_matches("example.com", "www.example.com"));
+        assert!(host_matches("example.com", ".example.com"));
+        // substring match must NOT trigger
+        assert!(!host_matches("notexample.com", "example.com"));
+        assert!(!host_matches("example.com.evil.com", "example.com"));
+        assert!(!host_matches("", "example.com"));
+        assert!(!host_matches("example.com", ""));
     }
 
     #[test]
