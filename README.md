@@ -263,7 +263,7 @@ cargo clippy --all-targets -- -D warnings
 cargo build --release
 ```
 
-CI (`.github/workflows/ci.yml`) runs `cargo fmt --check` and `cargo clippy --all-targets -- -D warnings`, then `cargo test` and `cargo build --release` on `ubuntu-latest` and `macos-14`, plus `cargo check` on Rust 1.89 (MSRV). Live network tests are `#[ignore]`d so CI stays deterministic. Pushing a `v*` tag runs `.github/workflows/release.yml`, which builds the release binaries and creates the GitHub Release.
+CI (`.github/workflows/ci.yml`) runs `cargo fmt --check` and `cargo clippy --all-targets -- -D warnings`, then `cargo test` and `cargo build --release` on `ubuntu-latest` and `macos-15`, plus `cargo check` on Rust 1.89 (MSRV). Live network tests are `#[ignore]`d so CI stays deterministic. Pushing a `v*` tag runs `.github/workflows/release.yml`, which builds the release binaries and creates the GitHub Release.
 
 Source layout:
 
