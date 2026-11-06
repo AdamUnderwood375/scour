@@ -1,11 +1,14 @@
 [package]
 name = "scour"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2024"
+rust-version = "1.89"
 license = "MIT"
-description = "Fast local web scraper & search (Rust) — single-page, batch, crawl, BM25 focus, keyless search, 1-hour cache"
+description = "Fast local web scraper & keyless search for LLM agents (Rust CLI + MCP): HTTP-first with headless-Chromium fallback, 5-engine fused search, GitHub/registry shortcuts, focus filtering, size-capped markdown"
 repository = "https://github.com/AdamUnderwood375/scour"
 readme = "README.md"
+keywords = ["scraper", "mcp", "search", "llm", "markdown"]
+categories = ["command-line-utilities", "web-programming"]
 
 [dependencies]
 ammonia = "4.1.4"

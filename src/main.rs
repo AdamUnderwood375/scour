@@ -223,6 +223,34 @@ pub struct SearchRequest {
     pub _extra: HashMap<String, serde_json::Value>,
 }
 
+#[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
+pub struct GithubRepoRequest {
+    #[schemars(description = "owner/repo or any github.com URL")]
+    pub repo: String,
+    #[schemars(description = "Include a README excerpt (default false)")]
+    #[serde(default)]
+    pub readme: Option<bool>,
+    #[schemars(description = "README excerpt cap in chars (default 1500)")]
+    #[serde(default)]
+    pub max_chars: Option<usize>,
+    #[schemars(description = "Return only the README paragraphs relevant to this query, best-first")]
+    #[serde(default)]
+    pub focus: Option<String>,
+}
+
+#[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
+pub struct PackageInfoRequest {
+    #[schemars(description = "Registry: crates | npm | pypi (aliases ok)")]
+    pub registry: String,
+    #[schemars(description = "Package name")]
+    pub name: String,
+}
+
+#[derive(Debug, serde::Serialize, schemars::JsonSchema)]
+pub struct TextResult {
+    pub text: String,
+}
+
 #[derive(Debug, serde::Serialize, schemars::JsonSchema, Clone)]
 pub struct SearchHit {
     pub title: String,
@@ -345,7 +373,34 @@ impl Scour {
         Ok(Json(serde_json::json!({"cleared": true})))
     }
 
-    #[tool(description = "Search the web (keyless, via DuckDuckGo, Bing, Brave and Mojeek, parallel, deduped and ranked). Returns title/url/snippet hits. Use before `scrape` to discover URLs. Supports site:, freshness, and exclude_sites filters.")]
+    #[tool(description = "Look up a GitHub repo via the GitHub API (no HTML scraping; honors GITHUB_TOKEN for rate limits). Returns markdown: stars, language, latest release, description, and an optional focus-filtered README excerpt.")]
+    async fn github_repo(
+        &self,
+        Parameters(req): Parameters<GithubRepoRequest>,
+    ) -> Result<Json<TextResult>, ErrorData> {
+        let text = gh_summary(
+            &req.repo,
+            req.readme.unwrap_or(false),
+            req.focus.as_deref(),
+            req.max_chars.unwrap_or(1500),
+        )
+        .await
+        .map_err(|e| ErrorData::internal_error(format!("github_repo failed for {}: {e}", req.repo), None))?;
+        Ok(Json(TextResult { text }))
+    }
+
+    #[tool(description = "Look up the latest package version via the registry APIs (crates.io / npm / PyPI; no HTML scraping, honors GITHUB_TOKEN where relevant). Returns markdown. `registry` accepts crates|npm|pypi and aliases.")]
+    async fn package_info(
+        &self,
+        Parameters(req): Parameters<PackageInfoRequest>,
+    ) -> Result<Json<TextResult>, ErrorData> {
+        let text = tools::pkg(&req.registry, &req.name)
+            .await
+            .map_err(|e| ErrorData::internal_error(format!("package_info failed for {}: {e}", req.name), None))?;
+        Ok(Json(TextResult { text }))
+    }
+
+    #[tool(description = "Search the web (keyless, fused across Bing, Yahoo, Brave, DuckDuckGo and Mojeek; paced with per-engine cooldowns, deduped and ranked). Returns title/url/snippet hits. Use before `scrape` to discover URLs. Supports site:, freshness, and exclude_sites filters.")]
     async fn search(
         &self,
         Parameters(req): Parameters<SearchRequest>,
@@ -369,7 +424,7 @@ impl Scour {
         }))
     }
 
-    #[tool(description = "Screenshot a page via the Brave headless backend. Returns base64 PNG (truncated preview). Requires Chrome/Brave.")]
+    #[tool(description = "Screenshot a page via headless Chromium (Brave/Chrome/Chromium or Playwright's Chromium; SCOUR_BROWSER to override). Returns base64 PNG (truncated preview).")]
     async fn screenshot(
         &self,
         Parameters(req): Parameters<ScrapeRequest>,
@@ -398,9 +453,9 @@ fn version_info() -> serde_json::Value {
     serde_json::json!({
         "name": "scour",
         "version": env!("CARGO_PKG_VERSION"),
-        "tools": ["scrape", "scrape_batch", "crawl", "search", "screenshot", "cache_clear", "scour_version"],
-        "features": ["http+chrome ladder", "readability+fallback", "bm25 focus", "parallel batch", "in-domain crawl", "links+page_type", "1hr cache", "keyless search", "screenshot", "offset pagination", "include_media", "actions", "pdf pages"],
-        "browser": std::env::var("SCOUR_BROWSER").unwrap_or("/usr/bin/brave".to_string())
+        "tools": ["scrape", "scrape_batch", "crawl", "search", "github_repo", "package_info", "screenshot", "cache_clear", "scour_version"],
+        "features": ["http+chrome ladder", "readability+fallback", "bm25 focus", "parallel batch", "in-domain crawl", "5-engine fused search", "search --fetch", "github/registry shortcuts", "ssrf guard", "fence-aware markdown cleanup", "links+page_type", "1hr cache", "keyless search", "screenshot", "offset pagination", "include_media", "actions", "pdf pages"],
+        "browser": fetcher::browser_path().map(|p| p.display().to_string()).unwrap_or_else(|_| "none found".to_string())
     })
 }
 
@@ -1878,20 +1933,26 @@ async fn cmd_gh(args: &[String]) -> anyhow::Result<()> {
 /// One spec's output: repo summary, plus the README excerpt when asked. A README failure is
 /// reported inline; only the repo lookup decides success.
 async fn gh_one(spec: &str, o: &GhOpts) -> anyhow::Result<String> {
-    let (repo, readme) = tools::gh_with_readme(spec, o.readme).await?;
+    gh_summary(spec, o.readme, o.focus.as_deref(), o.max_chars).await
+}
+
+/// Shared GitHub repo summary used by the CLI `gh` subcommand and the MCP `github_repo` tool.
+/// Returns the repo markdown plus, when `readme`, a focus-filtered, size-capped README excerpt.
+async fn gh_summary(spec: &str, readme: bool, focus: Option<&str>, max_chars: usize) -> anyhow::Result<String> {
+    let (repo, readme) = tools::gh_with_readme(spec, readme).await?;
     let Some(readme) = readme else {
         return Ok(repo);
     };
     let excerpt = match readme {
         Ok(text) => {
-            let (text, missed) = match &o.focus {
+            let (text, missed) = match focus {
                 Some(q) => match focus_filter(&text, q, 5) {
                     Some(t) => (t, false),
                     None => (text, true),
                 },
                 None => (text, false),
             };
-            let (body, next) = cut_page(&text, missed, 0, o.max_chars);
+            let (body, next) = cut_page(&text, missed, 0, max_chars);
             let marker = if next.is_some() { "\n\n<!-- readme truncated -->" } else { "" };
             format!("## README (excerpt)\n{}{marker}", body.trim_end())
         }

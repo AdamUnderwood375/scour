@@ -63,8 +63,8 @@ pub fn cache_key_ext(
 }
 
 fn cache_file_path() -> PathBuf {
-    let base = std::env::var("HOME").unwrap_or_else(|_| "/home/adam-underwood".to_string());
-    PathBuf::from(base).join(".cache").join("scour").join("cache.json")
+    let base = std::env::var_os("HOME").map(PathBuf::from).unwrap_or_else(std::env::temp_dir);
+    base.join(".cache").join("scour").join("cache.json")
 }
 
 fn now_secs() -> u64 {

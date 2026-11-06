@@ -404,7 +404,7 @@ fn playwright_chromium() -> Option<std::path::PathBuf> {
     })
 }
 
-fn browser_path() -> Result<std::path::PathBuf> {
+pub(crate) fn browser_path() -> Result<std::path::PathBuf> {
     if let Ok(p) = std::env::var("SCOUR_BROWSER") {
         return Ok(p.into());
     }

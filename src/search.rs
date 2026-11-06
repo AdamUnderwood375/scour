@@ -64,8 +64,8 @@ fn now_ms() -> u64 {
 }
 
 fn engines_state_path() -> std::path::PathBuf {
-    let base = std::env::var("HOME").unwrap_or_else(|_| "/home/adam-underwood".to_string());
-    std::path::PathBuf::from(base).join(".cache").join("scour").join("engines.json")
+    let base = std::env::var_os("HOME").map(std::path::PathBuf::from).unwrap_or_else(std::env::temp_dir);
+    base.join(".cache").join("scour").join("engines.json")
 }
 
 /// Load the engine-state map, tolerating a missing or corrupt file (returns an
