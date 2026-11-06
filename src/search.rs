@@ -11,9 +11,9 @@
 //! html endpoint rate-limits aggressively (HTTP 202 anomaly page); when it
 //! fails we retry once via the DDG lite endpoint.
 
-use crate::SearchHit;
 use crate::fetcher;
-use crate::normalize_url;
+use crate::scrape::normalize_url;
+use crate::types::SearchHit;
 use base64::Engine as _;
 use fs2::FileExt;
 use std::collections::HashMap;

@@ -1,7 +1,7 @@
 //! Cache: in-memory LRU + persistent file cache (1hr TTL)
 //! Extracted from main.rs; now with true LRU (lru crate, cap 200) and file locking (fs2).
 
-use crate::ScrapeResult;
+use crate::types::ScrapeResult;
 use fs2::FileExt;
 use lru::LruCache;
 use std::collections::HashMap;
@@ -32,7 +32,7 @@ pub fn cache_key_ext(
     offset: Option<usize>,
     include_media: bool,
     pages: Option<&str>,
-    actions: Option<&[crate::Action]>,
+    actions: Option<&[crate::types::Action]>,
 ) -> String {
     // Key on the *content* of the action sequence, not just its length, so two
     // different sequences of equal length can't collide. No actions keeps the
