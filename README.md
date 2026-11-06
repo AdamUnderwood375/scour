@@ -32,14 +32,14 @@ Quality is scored automatically against live crates.io and GitHub APIs, URL live
 |---|---|---|---|---|---|
 | scour as MCP tools (v0.1) | 17 | 3.85M | $0.651 | 77 s | 93/100 |
 | scour CLI + skill (v0.1) | 19 | 591k | $0.0186 | 89 s | 92/100 |
-| scour CLI + skill (v0.2, mean of 3 runs) | 11.7 | 255k | $0.0106 | 67 s | 100/100 |
+| scour CLI + skill (v0.2, mean of 3 runs) | 13.3 | 284k | $0.0117 | 61 s | 100/100 |
 
 - MCP tool results stay in the context and are re-sent on every later turn, so each extra call costs more than its own output.
 - v0.2 removes round trips: `search --fetch` fetches pages in the same call, `gh`/`pkg` answer fact questions without scraping, and truncation hints are paste-able continuations.
 - Numbers vary run to run and depend on search-engine availability. This is one task on one model, not a general benchmark.
 - Reproduce it with `bench/` (see [bench/README.md](bench/README.md)).
 
-Quality checks compare against live crates.io/GitHub data at scoring time, so re-scoring old runs after a new release lowers their score.
+Quality is scored against live crates.io/GitHub data at scoring time (v0.1 rows were scored when they ran), so re-scoring old runs after a new upstream release lowers their score. The v0.2 runs ranged from 11 to 16 calls.
 
 ## Install
 
