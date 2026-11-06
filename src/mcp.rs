@@ -157,17 +157,12 @@ pub struct TextResult {
 }
 
 #[derive(Clone)]
-pub(crate) struct Scour {
-    #[allow(dead_code)]
-    tool_router: rmcp::handler::server::router::tool::ToolRouter<Self>,
-}
+pub(crate) struct Scour;
 
 #[tool_router]
 impl Scour {
     pub(crate) fn new() -> Self {
-        Self {
-            tool_router: Self::tool_router(),
-        }
+        Self
     }
 
     #[tool(

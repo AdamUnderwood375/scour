@@ -179,9 +179,6 @@ pub struct Fetched {
     /// through — see `run()`. Without this, a browser that renders a bot
     /// shell looks identical to success.
     pub escalated: bool,
-    /// Status from the cheap tier, kept for diagnostics after escalation.
-    #[allow(dead_code)]
-    pub first_status: u16,
 }
 
 pub fn client() -> &'static reqwest::Client {
@@ -383,7 +380,6 @@ async fn fetch_http(url: &str) -> Result<Fetched> {
         tier: Tier::Http,
         status,
         escalated: false,
-        first_status: status,
     })
 }
 
@@ -456,11 +452,7 @@ fn browser() -> Result<&'static Mutex<headless_chrome::Browser>> {
     B.get().ok_or_else(|| anyhow!("browser init race"))
 }
 
-fn fetch_chrome_blocking(
-    url: &str,
-    first_status: u16,
-    first_reason: Option<String>,
-) -> Result<(Fetched, String)> {
+fn fetch_chrome_blocking(url: &str, first_reason: Option<String>) -> Result<(Fetched, String)> {
     let tab = {
         let b = browser().map_err(|e| anyhow!("{e}"))?;
         let guard = b.lock().map_err(|_| anyhow!("browser mutex poisoned"))?;
@@ -494,7 +486,6 @@ fn fetch_chrome_blocking(
             tier: Tier::Chrome,
             status: 200,
             escalated: true,
-            first_status,
         },
         final_url,
     ))
@@ -523,21 +514,17 @@ pub async fn fetch(url: &str) -> Result<Fetched> {
     // Chrome resolves DNS itself, bypassing PublicOnlyDns — guard before it
     // ever navigates.
     check_public_url(url).await?;
-    let first_status = cheap.as_ref().map(|f| f.status).unwrap_or(0);
     let first_reason = cheap.as_ref().ok().and_then(|f| f.reason.clone());
     let u = url.to_string();
     // headless_chrome is sync; keep it off the async runtime's worker threads.
-    let (fetched, final_url) = match tokio::task::spawn_blocking(move || {
-        fetch_chrome_blocking(&u, first_status, first_reason)
-    })
-    .await?
-    {
-        Ok(pair) => pair,
-        // Browser missing/unlaunchable: better to hand back the blocked cheap
-        // response (agent sees the challenge page, `blocked: true`) than to
-        // fail the call outright.
-        Err(e) => return cheap.map_err(|_| e),
-    };
+    let (fetched, final_url) =
+        match tokio::task::spawn_blocking(move || fetch_chrome_blocking(&u, first_reason)).await? {
+            Ok(pair) => pair,
+            // Browser missing/unlaunchable: better to hand back the blocked cheap
+            // response (agent sees the challenge page, `blocked: true`) than to
+            // fail the call outright.
+            Err(e) => return cheap.map_err(|_| e),
+        };
     // Chrome may have followed redirects on its own; re-check where it landed
     // and discard the content if it ended on a non-public host.
     check_public_url(&final_url).await?;

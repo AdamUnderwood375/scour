@@ -1210,7 +1210,7 @@ mod tests {
         assert_eq!(cooldown_ms_for("ddg"), COOLDOWN_DDG_MS);
         assert_eq!(cooldown_ms_for("ddg-lite"), COOLDOWN_DDG_MS);
         assert_eq!(cooldown_ms_for("bing"), COOLDOWN_OTHER_MS);
-        assert!(COOLDOWN_DDG_MS > COOLDOWN_OTHER_MS);
+        const { assert!(COOLDOWN_DDG_MS > COOLDOWN_OTHER_MS) };
     }
 
     #[test]

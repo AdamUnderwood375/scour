@@ -536,7 +536,6 @@ async fn fetch_chrome_with_actions(
                     reason: reason.clone(),
                     first_reason: None,
                     escalated: true,
-                    first_status: 200,
                 },
             ))
         })

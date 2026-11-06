@@ -2,7 +2,6 @@
 //!
 //! One call → compact markdown, so agents skip scraping JS-rendered pages
 //! and bot-walled registries.
-#![allow(dead_code)]
 
 use anyhow::{Context, Result, anyhow, bail};
 use reqwest::StatusCode;
@@ -17,13 +16,6 @@ const CRATES_UA: &str = concat!(
     env!("CARGO_PKG_VERSION"),
     " (https://github.com/AdamUnderwood375/scour)"
 );
-
-/// Compact GitHub repo summary. `spec` is `owner/repo` or any github.com URL.
-pub async fn gh(spec: &str) -> Result<String> {
-    gh_with_readme(spec, false)
-        .await
-        .map(|(summary, _)| summary)
-}
 
 /// Repo summary and, when `readme`, the cleaned README. The README is requested only after the
 /// repo call succeeds, concurrently with the release lookup. A README error goes in the second
@@ -901,7 +893,7 @@ mod tests {
     #[tokio::test]
     #[ignore]
     async fn live_gh() {
-        let out = gh("tokio-rs/axum").await.unwrap();
+        let (out, _) = gh_with_readme("tokio-rs/axum", false).await.unwrap();
         println!("{out}");
     }
 
