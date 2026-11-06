@@ -50,5 +50,5 @@ All notable changes to this project are documented here. Format follows [Keep a 
 - Initial release: HTTP-first scraping with headless-Chromium fallback, markdown output with focus and size caps, search, and an MCP stdio server.
 
 [Unreleased]: https://github.com/AdamUnderwood375/scour/compare/v0.2.0...HEAD
-[0.2.0]: https://github.com/AdamUnderwood375/scour/releases/tag/v0.2.0
-[0.1.0]: https://github.com/AdamUnderwood375/scour/releases/tag/v0.1.0
+[0.2.0]: https://github.com/AdamUnderwood375/scour/compare/v0.1.0...v0.2.0
+[0.1.0]: https://github.com/AdamUnderwood375/scour/tree/v0.1.0

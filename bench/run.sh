@@ -80,11 +80,11 @@ run_arm() {
     t0=$(date +%s%3N)
     if [ "$arm" = "skill" ]; then
       timeout 900 pi -p --mode json --model "$MODEL" --thinking off \
-        --no-skills --skill "$SKILL_DIR" --session-id "$sid" \
+        --no-skills --no-extensions --no-context-files --skill "$SKILL_DIR" --session-id "$sid" \
         "$p" > "$B/$arm/w$w.json" 2> "$B/$arm/w$w.err"
     else
       timeout 900 pi -p --mode json --model "$MODEL" --thinking off \
-        --no-skills -e "$SCOUR_MCP_EXT" --session-id "$sid" \
+        --no-skills --no-extensions --no-context-files -e "$SCOUR_MCP_EXT" --session-id "$sid" \
         "$p" > "$B/$arm/w$w.json" 2> "$B/$arm/w$w.err"
     fi
     local rc=$?
