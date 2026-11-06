@@ -113,7 +113,7 @@ def score_w2(arm, gt):
         live_frac = tot / len(check)
     year = 1.0 if ('2025' in t or '2026' in t) else 0.0
     tl = t.lower()
-    tradeoff = 1.0 if ('trade-off' in tl or 'tradeoff' in tl or 'trade' in tl) else 0.0
+    tradeoff = 1.0 if re.search(r'trade-?offs?', tl) else 0.0
     items = {'three_nonsearch_urls': has3, 'urls_live': round(live_frac, 2),
              'mentions_year': year, 'tradeoffs': tradeoff}
     score = round(100 * sum(items.values()) / len(items), 1)

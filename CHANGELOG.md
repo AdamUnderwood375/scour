@@ -2,6 +2,8 @@
 
 All notable changes to this project are documented here. Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [Unreleased]
+
 ## [0.2.0] - 2026-11-06
 
 ### Added
@@ -14,16 +16,19 @@ All notable changes to this project are documented here. Format follows [Keep a 
 - Playwright-managed Chromium as a browser-tier fallback.
 - macOS browser auto-detection (Brave, Google Chrome, Chromium, Playwright cache).
 - Main-content root selection, boilerplate stripping, and verbatim code blocks in extraction.
+- Wikipedia infoboxes render after the lead paragraph.
+- Extraction caps nesting depth.
+- Size-aware class filtering for boilerplate removal.
 - Prebuilt release binaries for Linux and macOS (x86_64 and aarch64).
 - `bench/`: reproducible benchmark harness.
-- MCP `scour_version` tool and JSON `--version`.
+- `--version` prints JSON (version, tools, features).
 
 ### Changed
 - `main.rs` split into `cli.rs`, `mcp.rs`, and `scrape.rs`.
 - Fetch timeouts: 6 s connect, 15 s total, 25 s per-page deadline in `batch` and `--fetch`; 20 MB body cap.
 - Focus is fence-aware and IDF-weighted, with heading boosts. Truncation cuts on paragraph boundaries.
 - Search pacing is shared across processes. Blocked engines cool down (10 min DuckDuckGo, 2 min others); cooldowns are bypassed when every engine is cooling.
-- Cache TTL is 1 hour; failed fetches are not cached.
+- Failed fetches are no longer cached.
 - MCP tool descriptions rewritten to match behavior.
 
 ### Fixed
@@ -40,9 +45,10 @@ All notable changes to this project are documented here. Format follows [Keep a 
 - Browser tier checks the URL before navigation and the final URL after redirects, including for `actions` and `screenshot`.
 - Cache keys include an action hash, so action results never leak across requests.
 
-## [0.1.0] - initial release
+## [0.1.0] - 2026-09-08
 
 - Initial release: HTTP-first scraping with headless-Chromium fallback, markdown output with focus and size caps, search, and an MCP stdio server.
 
-[0.2.0]: https://github.com/AdamUnderwood375/scour/compare/v0.1.0...v0.2.0
+[Unreleased]: https://github.com/AdamUnderwood375/scour/compare/v0.2.0...HEAD
+[0.2.0]: https://github.com/AdamUnderwood375/scour/releases/tag/v0.2.0
 [0.1.0]: https://github.com/AdamUnderwood375/scour/releases/tag/v0.1.0
