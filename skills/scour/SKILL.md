@@ -5,7 +5,7 @@ description: Fast local web scraper + keyless search (Rust CLI, no MCP tax). Sea
 
 # Scour: web research from bash
 
-Bin: `S=~/scour/target/release/scour` (`$S --help` for all flags).
+Bin: `S=$(command -v scour || echo ~/scour/target/release/scour)` (`$S --help` for all flags).
 
 Wall clock and tokens are dominated by **model turns**, not fetching. Every recipe below is ONE bash call. Aim for 1–3 scour calls per research task.
 
@@ -25,7 +25,7 @@ Wall clock and tokens are dominated by **model turns**, not fetching. Every reci
 
 Combine facts and articles in the same bash call:
 ```bash
-S=~/scour/target/release/scour
+S=$(command -v scour || echo ~/scour/target/release/scour)
 $S gh tokio-rs/axum actix/actix-web --readme --max-chars 800; $S pkg crates axum actix-web
 $S search "axum vs actix web comparison 2025" --max 8 --fetch 3 --max-chars 2500
 ```

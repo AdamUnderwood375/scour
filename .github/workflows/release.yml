@@ -1,0 +1,76 @@
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:   # manual dry run: build + upload artifacts, no release
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+          - os: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-gnu
+          - os: macos-14
+            target: aarch64-apple-darwin
+          - os: macos-13
+            target: x86_64-apple-darwin
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
+      - name: Build (native, no cross)
+        run: cargo build --release --locked
+      - name: Package
+        run: |
+          NAME="scour-${GITHUB_REF_NAME//\//-}-${{ matrix.target }}"
+          STAGE="$RUNNER_TEMP/stage"
+          mkdir -p "$STAGE/skills/scour" dist
+          cp target/release/scour README.md LICENSE "$STAGE/"
+          cp skills/scour/SKILL.md "$STAGE/skills/scour/"
+          tar -C "$STAGE" -czf "dist/$NAME.tar.gz" scour README.md LICENSE skills
+          (cd dist && shasum -a 256 "$NAME.tar.gz" > "$NAME.tar.gz.sha256")
+          ls -l dist
+      - uses: actions/upload-artifact@v4
+        with:
+          name: scour-${{ matrix.target }}
+          path: dist/*
+          if-no-files-found: error
+
+  release:
+    needs: build
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    env:
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: scour-*
+          merge-multiple: true
+          path: dist
+      - name: Release notes (CHANGELOG section + generated notes)
+        run: |
+          VERSION="${GITHUB_REF_NAME#v}"
+          awk -v h="## [$VERSION]" 'index($0, h) == 1 {p = 1; next} /^## \[/ {p = 0} p' CHANGELOG.md > notes.md
+          if [ ! -s notes.md ]; then
+            echo "::error::CHANGELOG.md has no section for [$VERSION]"
+            exit 1
+          fi
+          printf '\n' >> notes.md
+          gh api "repos/$GITHUB_REPOSITORY/releases/generate-notes" -f tag_name="$GITHUB_REF_NAME" --jq .body >> notes.md
+      - name: Create GitHub Release
+        run: gh release create "$GITHUB_REF_NAME" dist/* --title "$GITHUB_REF_NAME" --notes-file notes.md
