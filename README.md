@@ -37,22 +37,36 @@ Quality is scored automatically against live crates.io and GitHub APIs, URL live
 - MCP tool results stay in the context and are re-sent on every later turn, so each extra call costs more than its own output.
 - v0.2 removes round trips: `search --fetch` fetches pages in the same call, `gh`/`pkg` answer fact questions without scraping, and truncation hints are paste-able continuations.
 - Numbers vary run to run and depend on search-engine availability. This is one task on one model, not a general benchmark.
+- Reproduce it with `bench/` (see [bench/README.md](bench/README.md)).
 
 ## Install
+
+Prebuilt binaries for Linux and macOS (x86_64 and aarch64) are on the [Releases page](https://github.com/AdamUnderwood375/scour/releases). Or download from the command line:
+
+```sh
+gh release download --repo AdamUnderwood375/scour --pattern '*x86_64-unknown-linux-gnu.tar.gz'
+tar xzf scour-*-x86_64-unknown-linux-gnu.tar.gz scour && install -m 755 scour ~/.local/bin/
+```
+
+With Rust installed, install from git. The crates.io name `scour` belongs to another project:
+
+```sh
+cargo install --git https://github.com/AdamUnderwood375/scour
+```
+
+To build from source:
 
 ```sh
 git clone https://github.com/AdamUnderwood375/scour
 cd scour
 cargo build --release                # binary: target/release/scour
-# or put it on PATH:
-cargo install --path .
 ```
 
-Requires Rust 1.89+ (edition 2024). Optional runtime dependencies:
+Building from source requires Rust 1.89+ (edition 2024). Optional runtime dependencies:
 
 | Dependency | Needed for | Notes |
 |---|---|---|
-| Chromium-based browser | JavaScript and bot-walled pages; `screenshot` | Auto-detects `/usr/bin/brave`, `/usr/bin/brave-browser`, `/opt/brave-bin/brave`, `/usr/bin/chromium`, `/usr/bin/google-chrome-stable`, then Playwright's Chromium under `~/.cache/ms-playwright`. Override with `SCOUR_BROWSER=/path/to/browser`. |
+| Chromium-based browser | JavaScript and bot-walled pages; `screenshot` | Auto-detects `/usr/bin/brave`, `/usr/bin/brave-browser`, `/opt/brave-bin/brave`, `/usr/bin/chromium`, `/usr/bin/google-chrome-stable`, then on macOS `/Applications/Brave Browser.app`, `Google Chrome.app`, and `Chromium.app`. Finally Playwright's Chromium under `~/.cache/ms-playwright` (`~/Library/Caches/ms-playwright` on macOS). Override with `SCOUR_BROWSER=/path/to/browser`. |
 | `pdftotext` (poppler) | PDF URLs and PDF responses | Without it, PDFs return a warning and no text. |
 | `GITHUB_TOKEN` | Heavy use of `gh` | Optional. Unauthenticated GitHub API allows 60 requests/hour. |
 
@@ -122,7 +136,7 @@ mkdir -p ~/.claude/skills/scour && cp skills/scour/SKILL.md ~/.claude/skills/sco
 mkdir -p ~/.pi/agent/skills/scour && cp skills/scour/SKILL.md ~/.pi/agent/skills/scour/ # pi
 ```
 
-The skill assumes the checkout is at `~/scour` (the `S=` line). Edit that line if yours lives elsewhere. No server or schema is loaded, so the agent pays no tool-schema cost.
+The skill runs `scour` from `PATH` and falls back to `~/scour/target/release/scour`. No server or schema is loaded, so the agent pays no tool-schema cost.
 
 ### (b) MCP server
 
@@ -229,24 +243,35 @@ scour is meant to be given URLs by an agent, so it refuses to reach internal net
 
 **Known limitation: DNS rebinding.** The browser resolves DNS itself after scour's pre-check. A hostname that returns a public address to the check and a private one to Chrome can get past it. If you need a hard guarantee, run scour where it has no route to internal networks.
 
+## Known limitations
+
+- **Reddit** blocks unauthenticated access, HTML and JSON alike, from most IPs. Expect `content_ok: false`.
+- **X/Twitter** returns only a login shell without an account.
+- **DuckDuckGo and Mojeek** rate-limit or captcha datacenter and heavy-use IPs. scour cools them down and relies on the other engines, so results can be thinner.
+- **DNS rebinding** can get past the browser-tier pre-check. See [Security](#security).
+
 ## Development
 
 ```sh
+cargo fmt --check
 cargo test                       # unit tests
 cargo test -- --ignored          # live gh/pkg checks (needs network)
-cargo clippy -- -D warnings
+cargo clippy --all-targets -- -D warnings
 cargo build --release
 ```
 
-CI (`.github/workflows/ci.yml`) runs `cargo test`, `cargo clippy -- -D warnings`, and `cargo build --release` on `ubuntu-latest` with stable Rust. Live network tests are `#[ignore]`d so CI stays deterministic.
+CI (`.github/workflows/ci.yml`) runs `cargo fmt --check` and `cargo clippy --all-targets -- -D warnings`, then `cargo test` and `cargo build --release` on `ubuntu-latest` and `macos-14`, plus `cargo check` on Rust 1.89 (MSRV). Live network tests are `#[ignore]`d so CI stays deterministic. Pushing a `v*` tag runs `.github/workflows/release.yml`, which builds the release binaries and creates the GitHub Release.
 
 Source layout:
 
 | File | Contents |
 |---|---|
-| `src/main.rs` | CLI subcommands, MCP server (rmcp), focus, truncation, output formatting |
+| `src/main.rs` | Entry point: dispatches to the CLI or the MCP server |
+| `src/cli.rs` | CLI parsing and output |
+| `src/mcp.rs` | MCP server (rmcp) and tools |
+| `src/scrape.rs` | Scrape pipeline: focus, truncation, PDF, crawl, links, screenshot |
 | `src/fetcher.rs` | HTTP tier, block detection, SSRF guards, headless Chromium tier |
-| `src/extractor.rs` | Readability extraction, list/link fallback, markdown cleanup |
+| `src/extractor.rs` | Main-content selection, boilerplate stripping, code blocks, markdown cleanup |
 | `src/search.rs` | Engine queries, pacing and cooldowns, parsers, rank fusion |
 | `src/tools.rs` | `gh` and `pkg` lookups (GitHub, crates.io, npm, PyPI) |
 | `src/cache.rs` | 1-hour LRU and file cache |
