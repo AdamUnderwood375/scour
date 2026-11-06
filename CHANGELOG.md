@@ -30,6 +30,7 @@ All notable changes to this project are documented here. Format follows [Keep a 
 - Search pacing is shared across processes. Blocked engines cool down (10 min DuckDuckGo, 2 min others); cooldowns are bypassed when every engine is cooling.
 - Failed fetches are no longer cached.
 - MCP tool descriptions rewritten to match behavior.
+- Dependencies updated (scraper 0.29, rmcp 3.9, lru 0.19, base64 0.23, tokio, reqwest, ammonia). CI checks fmt, clippy, tests on Linux and macOS, and MSRV 1.89; Dependabot enabled.
 
 ### Fixed
 - Timeouts no longer escalate to the headless browser.

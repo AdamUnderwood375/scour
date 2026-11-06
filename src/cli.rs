@@ -113,12 +113,13 @@ fn emit_scrape(r: &ScrapeResult, focus: Option<&str>, max_chars: usize) {
         eprintln!("next: {a}");
     }
     eprintln!(
-        "page_type: {} quality: {:.2} links: {} headings: {} next_offset: {:?} media: {}",
+        "page_type: {} quality: {:.2} links: {} headings: {} next_offset: {} media: {}",
         r.page_type,
         r.quality_score,
         r.links.len(),
         r.headings.len(),
-        r.next_offset,
+        r.next_offset
+            .map_or_else(|| "-".to_string(), |n| n.to_string()),
         r.media.len()
     );
     println!(
