@@ -385,12 +385,17 @@ async fn fetch_http(url: &str) -> Result<Fetched> {
 
 /// Reuse the browser already on this machine instead of downloading another.
 /// Brave is Chromium-based, so it speaks the same DevTools protocol.
-/// Newest Playwright-managed Chromium (`~/.cache/ms-playwright/chromium-*/chrome-linux*/chrome`).
+/// Newest Playwright-managed Chromium, Linux (`~/.cache/ms-playwright/chromium-*/chrome-linux*/chrome`)
+/// or macOS (`~/Library/Caches/ms-playwright/chromium-*/chrome-mac*/Chromium.app/Contents/MacOS/Chromium`).
 fn playwright_chromium() -> Option<std::path::PathBuf> {
-    let root = std::path::PathBuf::from(std::env::var_os("HOME")?).join(".cache/ms-playwright");
-    let mut dirs: Vec<_> = std::fs::read_dir(&root)
-        .ok()?
-        .flatten()
+    let home = std::path::PathBuf::from(std::env::var_os("HOME")?);
+    let roots = [
+        home.join(".cache/ms-playwright"),
+        home.join("Library/Caches/ms-playwright"),
+    ];
+    let mut dirs: Vec<_> = roots
+        .iter()
+        .flat_map(|root| std::fs::read_dir(root).into_iter().flatten().flatten())
         .map(|e| e.path())
         .filter(|p| {
             p.file_name()
@@ -400,10 +405,15 @@ fn playwright_chromium() -> Option<std::path::PathBuf> {
         .collect();
     dirs.sort();
     dirs.iter().rev().find_map(|d| {
-        ["chrome-linux64/chrome", "chrome-linux/chrome"]
-            .iter()
-            .map(|s| d.join(s))
-            .find(|p| p.exists())
+        [
+            "chrome-linux64/chrome",
+            "chrome-linux/chrome",
+            "chrome-mac/Chromium.app/Contents/MacOS/Chromium",
+            "chrome-mac-arm64/Chromium.app/Contents/MacOS/Chromium",
+        ]
+        .iter()
+        .map(|s| d.join(s))
+        .find(|p| p.exists())
     })
 }
 
@@ -411,12 +421,15 @@ pub(crate) fn browser_path() -> Result<std::path::PathBuf> {
     if let Ok(p) = std::env::var("SCOUR_BROWSER") {
         return Ok(p.into());
     }
-    const CANDIDATES: [&str; 5] = [
+    const CANDIDATES: [&str; 8] = [
         "/usr/bin/brave",
         "/usr/bin/brave-browser",
         "/opt/brave-bin/brave",
         "/usr/bin/chromium",
         "/usr/bin/google-chrome-stable",
+        "/Applications/Brave Browser.app/Contents/MacOS/Brave Browser",
+        "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
+        "/Applications/Chromium.app/Contents/MacOS/Chromium",
     ];
     CANDIDATES
         .iter()
