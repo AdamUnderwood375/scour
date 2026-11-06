@@ -11,6 +11,60 @@ use std::net::IpAddr;
 use std::sync::OnceLock;
 use std::time::Duration;
 
+/// Parameters for the scrape pipeline. Build with `ScrapeParams::new(url, max_chars)`
+/// then override the fields that differ from the defaults.
+#[derive(Clone, Copy)]
+pub(crate) struct ScrapeParams<'a> {
+    pub url: &'a str,
+    pub focus: Option<&'a str>,
+    pub max_chars: usize,
+    pub include_links: bool,
+    pub offset: Option<usize>,
+    pub include_media: bool,
+    pub pages: Option<&'a str>,
+    pub actions: Option<&'a [Action]>,
+}
+
+impl<'a> ScrapeParams<'a> {
+    pub fn new(url: &'a str, max_chars: usize) -> Self {
+        Self {
+            url,
+            focus: None,
+            max_chars,
+            include_links: true,
+            offset: None,
+            include_media: false,
+            pages: None,
+            actions: None,
+        }
+    }
+}
+
+/// Parameters for `crawl_run`.
+#[derive(Clone, Copy)]
+pub(crate) struct CrawlParams<'a> {
+    pub start_url: &'a str,
+    pub max_pages: usize,
+    pub max_depth: usize,
+    pub focus: Option<&'a str>,
+    pub max_chars: usize,
+    pub sitemap: Option<bool>,
+    pub discover_only: Option<bool>,
+    pub max_total_chars: Option<usize>,
+}
+
+/// Timing/size metrics for a scrape, passed to `Stats::scrape`.
+#[derive(Default)]
+struct ScrapeMetrics {
+    cache: &'static str,
+    status: u16,
+    ms: u128,
+    ms_fetch: u128,
+    ms_parse: u128,
+    bytes_down: usize,
+    dropped_paras: usize,
+}
+
 #[derive(serde::Serialize)]
 pub(crate) struct Stats {
     pub(crate) op: &'static str,
@@ -31,32 +85,22 @@ pub(crate) struct Stats {
 }
 
 impl Stats {
-    #[allow(clippy::too_many_arguments)]
-    fn scrape(
-        r: &ScrapeResult,
-        cache: &'static str,
-        status: u16,
-        ms: u128,
-        ms_fetch: u128,
-        ms_parse: u128,
-        bytes_down: usize,
-        dropped_paras: usize,
-    ) -> Stats {
+    fn scrape(r: &ScrapeResult, m: ScrapeMetrics) -> Stats {
         let chars_out = r.markdown.chars().count();
         Stats {
             op: "scrape",
             url: r.url.clone(),
             tier: r.tier.clone(),
-            status,
-            cache,
-            ms,
-            ms_fetch,
-            ms_parse,
-            bytes_down,
+            status: m.status,
+            cache: m.cache,
+            ms: m.ms,
+            ms_fetch: m.ms_fetch,
+            ms_parse: m.ms_parse,
+            bytes_down: m.bytes_down,
             chars_out,
             est_tokens: chars_out / 4,
             truncated: r.truncated,
-            dropped_paras,
+            dropped_paras: m.dropped_paras,
             quality: r.quality_score,
             page_type: r.page_type.clone(),
         }
@@ -401,24 +445,28 @@ async fn pdf_result(
 }
 
 /// Caches (when `content_ok`) and times a PDF result; shared by the `.pdf` path and magic-detected bodies.
-#[allow(clippy::too_many_arguments)]
 async fn pdf_out(
-    url: &str,
     key: String,
     bytes: Vec<u8>,
-    pages: Option<&str>,
-    focus: Option<&str>,
-    max_chars: usize,
-    offset: Option<usize>,
+    p: &ScrapeParams<'_>,
     t0: std::time::Instant,
 ) -> (ScrapeResult, Stats) {
-    let pdf = pdf_result(url, bytes, pages, focus, max_chars, offset).await;
+    let pdf = pdf_result(p.url, bytes, p.pages, p.focus, p.max_chars, p.offset).await;
     // A failed read (no pdftotext, scanned PDF) is not cached, so it is retried.
     if pdf.content_ok {
         cache_set(key, pdf.clone());
     }
     let ms = t0.elapsed().as_millis();
-    let stats = Stats::scrape(&pdf, "miss", 200, ms, ms, 0, 0, 0);
+    let stats = Stats::scrape(
+        &pdf,
+        ScrapeMetrics {
+            cache: "miss",
+            status: 200,
+            ms,
+            ms_fetch: ms,
+            ..Default::default()
+        },
+    );
     (pdf, stats)
 }
 
@@ -505,31 +553,21 @@ pub(crate) async fn run(
     max_chars: usize,
     include_links: bool,
 ) -> anyhow::Result<ScrapeResult> {
-    run_ext(
-        url,
+    run_ext(ScrapeParams {
         focus,
-        max_chars,
         include_links,
-        None,
-        false,
-        None,
-        None,
-    )
+        ..ScrapeParams::new(url, max_chars)
+    })
     .await
 }
 
-#[allow(clippy::too_many_arguments)]
-pub(crate) async fn run_ext(
-    url: &str,
-    focus: Option<&str>,
-    max_chars: usize,
-    include_links: bool,
-    offset: Option<usize>,
-    include_media: bool,
-    pages: Option<&str>,
-    actions: Option<&[Action]>,
-) -> anyhow::Result<ScrapeResult> {
-    Ok(run_ext_stats(
+pub(crate) async fn run_ext(p: ScrapeParams<'_>) -> anyhow::Result<ScrapeResult> {
+    Ok(run_ext_stats(p).await?.0)
+}
+
+// Same as `run_ext` but also returns timing/size stats for the `--stats` CLI flag.
+pub(crate) async fn run_ext_stats(p: ScrapeParams<'_>) -> anyhow::Result<(ScrapeResult, Stats)> {
+    let ScrapeParams {
         url,
         focus,
         max_chars,
@@ -538,23 +576,7 @@ pub(crate) async fn run_ext(
         include_media,
         pages,
         actions,
-    )
-    .await?
-    .0)
-}
-
-// Same as `run_ext` but also returns timing/size stats for the `--stats` CLI flag.
-#[allow(clippy::too_many_arguments)]
-pub(crate) async fn run_ext_stats(
-    url: &str,
-    focus: Option<&str>,
-    max_chars: usize,
-    include_links: bool,
-    offset: Option<usize>,
-    include_media: bool,
-    pages: Option<&str>,
-    actions: Option<&[Action]>,
-) -> anyhow::Result<(ScrapeResult, Stats)> {
+    } = p;
     let t0 = std::time::Instant::now();
     validate(url)?;
     let actions_len = actions.map(|a| a.len()).unwrap_or(0);
@@ -563,20 +585,36 @@ pub(crate) async fn run_ext_stats(
     let default_opts = offset.is_none() && !include_media && pages.is_none() && actions_len == 0;
     if let Some(cached) = cache_get(&key) {
         let ms = t0.elapsed().as_millis();
-        let stats = Stats::scrape(&cached, "hit", 200, ms, 0, 0, 0, 0);
+        let stats = Stats::scrape(
+            &cached,
+            ScrapeMetrics {
+                cache: "hit",
+                status: 200,
+                ms,
+                ..Default::default()
+            },
+        );
         return Ok((cached, stats));
     }
     // but also check legacy key for backwards compat when offset etc are default
     if default_opts && let Some(cached) = cache_get(&cache_key(url, focus, max_chars)) {
         let ms = t0.elapsed().as_millis();
-        let stats = Stats::scrape(&cached, "hit", 200, ms, 0, 0, 0, 0);
+        let stats = Stats::scrape(
+            &cached,
+            ScrapeMetrics {
+                cache: "hit",
+                status: 200,
+                ms,
+                ..Default::default()
+            },
+        );
         return Ok((cached, stats));
     }
     // `.pdf` URLs are read directly (size-capped) instead of through the HTML ladder.
     if is_pdf_url(url)
         && let Some(bytes) = fetch_pdf_direct(url).await?
     {
-        return Ok(pdf_out(url, key, bytes, pages, focus, max_chars, offset, t0).await);
+        return Ok(pdf_out(key, bytes, &p, t0).await);
     }
 
     let t_fetch = std::time::Instant::now();
@@ -596,7 +634,7 @@ pub(crate) async fn run_ext_stats(
             Some(b) => b,
             None => got.html.into_bytes(),
         };
-        return Ok(pdf_out(url, key, bytes, pages, focus, max_chars, offset, t0).await);
+        return Ok(pdf_out(key, bytes, &p, t0).await);
     }
     let status = got.status;
     let bytes_down = if matches!(got.tier, fetcher::Tier::Http) {
@@ -725,13 +763,15 @@ pub(crate) async fn run_ext_stats(
     let ms = t0.elapsed().as_millis();
     let stats = Stats::scrape(
         &out,
-        "miss",
-        status,
-        ms,
-        ms_fetch,
-        ms_parse,
-        bytes_down,
-        dropped_paras,
+        ScrapeMetrics {
+            cache: "miss",
+            status,
+            ms,
+            ms_fetch,
+            ms_parse,
+            bytes_down,
+            dropped_paras,
+        },
     );
     Ok((out, stats))
 }
@@ -768,17 +808,17 @@ async fn fetch_sitemap_urls(domain: &str) -> Vec<String> {
     result
 }
 
-#[allow(clippy::too_many_arguments)]
-pub(crate) async fn crawl_run(
-    start_url: &str,
-    max_pages: usize,
-    max_depth: usize,
-    focus: Option<&str>,
-    max_chars: usize,
-    sitemap: Option<bool>,
-    discover_only: Option<bool>,
-    max_total_chars: Option<usize>,
-) -> anyhow::Result<CrawlResult> {
+pub(crate) async fn crawl_run(p: CrawlParams<'_>) -> anyhow::Result<CrawlResult> {
+    let CrawlParams {
+        start_url,
+        max_pages,
+        max_depth,
+        focus,
+        max_chars,
+        sitemap,
+        discover_only,
+        max_total_chars,
+    } = p;
     validate(start_url)?;
     let start_domain = url::Url::parse(start_url)?
         .host_str()

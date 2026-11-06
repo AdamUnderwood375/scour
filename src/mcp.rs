@@ -2,7 +2,7 @@
 //! ServerHandler impl, and version_info.
 
 use crate::cli::{failed_doc, gh_summary};
-use crate::scrape::{crawl_run, run, run_ext, screenshot_run};
+use crate::scrape::{CrawlParams, ScrapeParams, crawl_run, run, run_ext, screenshot_run};
 use crate::search::search_run;
 use crate::types::*;
 use crate::{cache, fetcher, tools};
@@ -181,16 +181,15 @@ impl Scour {
         let include_media = opt.include_media.or(req.include_media).unwrap_or(false);
         let pages = opt.pages.clone().or(req.pages.clone());
         let actions = opt.actions.clone().or(req.actions.clone());
-        let doc = run_ext(
-            &req.url,
-            req.focus.as_deref(),
-            req.max_chars.unwrap_or(40_000),
-            req.include_links.unwrap_or(true),
-            req.offset,
+        let doc = run_ext(ScrapeParams {
+            focus: req.focus.as_deref(),
+            include_links: req.include_links.unwrap_or(true),
+            offset: req.offset,
             include_media,
-            pages.as_deref(),
-            actions.as_deref(),
-        )
+            pages: pages.as_deref(),
+            actions: actions.as_deref(),
+            ..ScrapeParams::new(&req.url, req.max_chars.unwrap_or(40_000))
+        })
         .await
         .map_err(|e| {
             ErrorData::internal_error(format!("scrape failed for {}: {e}", req.url), None)
@@ -253,16 +252,16 @@ impl Scour {
         let max_pages = req.max_pages.unwrap_or(5).clamp(1, 20);
         let max_depth = req.max_depth.unwrap_or(2).min(4);
         let max_chars = req.max_chars.unwrap_or(8000);
-        let res = crawl_run(
-            &req.url,
+        let res = crawl_run(CrawlParams {
+            start_url: &req.url,
             max_pages,
             max_depth,
-            req.focus.as_deref(),
+            focus: req.focus.as_deref(),
             max_chars,
-            req.sitemap,
-            req.discover_only,
-            req.max_total_chars,
-        )
+            sitemap: req.sitemap,
+            discover_only: req.discover_only,
+            max_total_chars: req.max_total_chars,
+        })
         .await
         .map_err(|e| {
             ErrorData::internal_error(format!("crawl failed for {}: {e}", req.url), None)

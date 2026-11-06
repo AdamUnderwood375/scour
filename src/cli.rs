@@ -2,7 +2,8 @@
 //! output helpers, and parallel fetch.
 
 use crate::scrape::{
-    Stats, crawl_run, cut_page, focus_filter, page_links, run_ext_stats, screenshot_png, validate,
+    CrawlParams, ScrapeParams, Stats, crawl_run, cut_page, focus_filter, page_links, run_ext_stats,
+    screenshot_png, validate,
 };
 use crate::search::search_run;
 use crate::types::*;
@@ -531,16 +532,10 @@ pub(crate) async fn fetch_all(
             tokio::spawn(async move {
                 let _permit = sem.acquire_owned().await;
                 // One dead host must not hold up the whole batch.
-                let fut = run_ext_stats(
-                    &url,
-                    focus.as_deref(),
-                    max_chars,
-                    true,
-                    None,
-                    false,
-                    None,
-                    None,
-                );
+                let fut = run_ext_stats(ScrapeParams {
+                    focus: focus.as_deref(),
+                    ..ScrapeParams::new(&url, max_chars)
+                });
                 tokio::time::timeout(PAGE_DEADLINE, fut)
                     .await
                     .unwrap_or_else(|_| {
@@ -627,16 +622,11 @@ fn print_item_stats(pages: &[PageFetch]) {
 
 pub(crate) async fn cmd_scrape(args: &[String]) -> anyhow::Result<()> {
     let o = parse_scrape(args).unwrap_or_else(|e| usage(&e));
-    match run_ext_stats(
-        &o.url,
-        o.focus.as_deref(),
-        o.max_chars,
-        true,
-        o.offset,
-        false,
-        None,
-        None,
-    )
+    match run_ext_stats(ScrapeParams {
+        focus: o.focus.as_deref(),
+        offset: o.offset,
+        ..ScrapeParams::new(&o.url, o.max_chars)
+    })
     .await
     {
         Ok((r, st)) => {
@@ -916,16 +906,16 @@ pub(crate) async fn cmd_links(args: &[String]) -> anyhow::Result<()> {
 pub(crate) async fn cmd_crawl(args: &[String]) -> anyhow::Result<()> {
     let o = parse_crawl(args).unwrap_or_else(|e| usage(&e));
     let t0 = std::time::Instant::now();
-    let res = crawl_run(
-        &o.url,
-        o.max_pages,
-        o.depth,
-        o.focus.as_deref(),
-        o.max_chars,
-        Some(o.sitemap),
-        None,
-        None,
-    )
+    let res = crawl_run(CrawlParams {
+        start_url: &o.url,
+        max_pages: o.max_pages,
+        max_depth: o.depth,
+        focus: o.focus.as_deref(),
+        max_chars: o.max_chars,
+        sitemap: Some(o.sitemap),
+        discover_only: None,
+        max_total_chars: None,
+    })
     .await?;
     if o.json {
         let mut v = serde_json::to_value(&res)?;
