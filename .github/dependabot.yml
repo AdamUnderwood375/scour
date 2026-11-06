@@ -13,6 +13,9 @@ updates:
     directory: /
     schedule:
       interval: weekly
+    ignore:
+      # Its refs are toolchain names (@stable, @1.89 = MSRV), not action versions.
+      - dependency-name: dtolnay/rust-toolchain
     groups:
       github-actions:
         patterns: ["*"]
