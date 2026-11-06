@@ -9,7 +9,7 @@ use crate::{cache, fetcher, tools};
 use rmcp::{
     ErrorData, ServerHandler,
     handler::server::wrapper::{Json, Parameters},
-    model::{ServerCapabilities, ServerInfo},
+    model::{ServerCapabilities, ServerConfig},
     schemars, tool, tool_handler, tool_router,
 };
 use std::collections::HashMap;
@@ -352,8 +352,8 @@ impl Scour {
 
 #[tool_handler]
 impl ServerHandler for Scour {
-    fn get_info(&self) -> ServerInfo {
-        ServerInfo::new(ServerCapabilities::builder().enable_tools().build())
+    fn get_info(&self) -> ServerConfig {
+        ServerConfig::new(ServerCapabilities::builder().enable_tools().build())
             .with_instructions("Local AI-first web scraper. Tools: `scrape` (single URL, focus-aware), `scrape_batch` (up to 10 URLs parallel), `crawl` (in-domain BFS). All return clean markdown + links + page_type + content_ok. Check content_ok first.")
     }
 }
