@@ -18,7 +18,9 @@ fn title_sel() -> &'static Selector {
     TITLE_SEL.get_or_init(|| Selector::parse("title").unwrap())
 }
 fn meta_desc_sel() -> &'static Selector {
-    META_DESC_SEL.get_or_init(|| Selector::parse(r#"meta[name="description"], meta[property="og:description"]"#).unwrap())
+    META_DESC_SEL.get_or_init(|| {
+        Selector::parse(r#"meta[name="description"], meta[property="og:description"]"#).unwrap()
+    })
 }
 fn body_sel() -> &'static Selector {
     BODY_SEL.get_or_init(|| Selector::parse("body").unwrap())
@@ -38,7 +40,7 @@ pub struct CleanDoc {
     pub text: String,
     pub links: Vec<Link>,
     pub description: Option<String>,
-    pub page_type: String, // article | list | media | unknown
+    pub page_type: String,  // article | list | media | unknown
     pub quality_score: f32, // 0.0-1.0 rough heuristic
 }
 
@@ -77,10 +79,9 @@ fn visible_text_len(html: &str) -> usize {
         if b[i] == b'<' {
             in_tag = true;
         }
-        if !in_tag && !in_script && b[i] != b'>'
-            && !b[i].is_ascii_whitespace() {
-                len += 1;
-            }
+        if !in_tag && !in_script && b[i] != b'>' && !b[i].is_ascii_whitespace() {
+            len += 1;
+        }
         if b[i] == b'>' {
             in_tag = false;
         }
@@ -100,7 +101,9 @@ fn extract_links(html: &str, base_url: &str) -> Vec<Link> {
             continue;
         }
         let abs = if let Some(b) = &base {
-            b.join(href).map(|u| u.to_string()).unwrap_or_else(|_| href.to_string())
+            b.join(href)
+                .map(|u| u.to_string())
+                .unwrap_or_else(|_| href.to_string())
         } else {
             href.to_string()
         };
@@ -125,8 +128,17 @@ fn extract_links(html: &str, base_url: &str) -> Vec<Link> {
 
 fn extract_meta(html: &str) -> (Option<String>, Option<String>) {
     let doc = Html::parse_document(html);
-    let title = doc.select(title_sel()).next().map(|e| e.text().collect::<String>().trim().to_string()).filter(|s| !s.is_empty());
-    let desc = doc.select(meta_desc_sel()).next().and_then(|e| e.value().attr("content")).map(|s| s.trim().to_string()).filter(|s| !s.is_empty());
+    let title = doc
+        .select(title_sel())
+        .next()
+        .map(|e| e.text().collect::<String>().trim().to_string())
+        .filter(|s| !s.is_empty());
+    let desc = doc
+        .select(meta_desc_sel())
+        .next()
+        .and_then(|e| e.value().attr("content"))
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty());
     (title, desc)
 }
 
@@ -163,7 +175,9 @@ pub fn clean_markdown(md: &str) -> String {
         }
         let lead = line.len() - line.trim_start().len();
         // Opening fence (indent < 4, else it is indented code).
-        if lead < 4 && let Some(ch) = fence_marker(line) {
+        if lead < 4
+            && let Some(ch) = fence_marker(line)
+        {
             flush_blanks(&mut out, &mut blanks);
             out.push_str(line);
             out.push('\n');
@@ -189,7 +203,9 @@ pub fn clean_markdown(md: &str) -> String {
             continue;
         }
         let has_text = t.chars().any(char::is_alphanumeric);
-        let rule_like = t.chars().all(|c| c.is_whitespace() || matches!(c, '|' | '-' | ':'));
+        let rule_like = t
+            .chars()
+            .all(|c| c.is_whitespace() || matches!(c, '|' | '-' | ':'));
         let separator_after_text = prev_text && t.contains('|') && t.contains('-');
         prev_text = has_text;
         prev_indent_code = false;
@@ -277,17 +293,32 @@ fn generate_link_markdown(title: &str, links: &[Link], html: &str) -> String {
             unique.push(l);
         }
     }
-    let link_lines: Vec<String> = unique.iter().take(50).map(|l| format!("- [{}]({})", l.text, l.href)).collect();
+    let link_lines: Vec<String> = unique
+        .iter()
+        .take(50)
+        .map(|l| format!("- [{}]({})", l.text, l.href))
+        .collect();
     if title.is_empty() {
         format!("{}\n\n{}", body_snippet, link_lines.join("\n"))
     } else {
-        format!("# {}\n\n{}\n\n{}", title, body_snippet, link_lines.join("\n"))
+        format!(
+            "# {}\n\n{}\n\n{}",
+            title,
+            body_snippet,
+            link_lines.join("\n")
+        )
     }
 }
 
 fn page_type(markdown: &str, links: &[Link], text_len: usize, html_len: usize) -> String {
-    let link_density = if text_len > 0 { links.len() as f32 / (text_len as f32 / 100.0) } else { 0.0 };
-    let has_list_markers = markdown.matches("\n- ").count() + markdown.matches("\n* ").count() + markdown.matches("\n1. ").count();
+    let link_density = if text_len > 0 {
+        links.len() as f32 / (text_len as f32 / 100.0)
+    } else {
+        0.0
+    };
+    let has_list_markers = markdown.matches("\n- ").count()
+        + markdown.matches("\n* ").count()
+        + markdown.matches("\n1. ").count();
     let has_headings = markdown.matches("\n#").count();
 
     if html_len < 2000 && text_len < 800 {
@@ -312,12 +343,18 @@ fn page_type(markdown: &str, links: &[Link], text_len: usize, html_len: usize) -
 }
 
 fn quality_score(text_len: usize, html_len: usize, links_len: usize, title_len: usize) -> f32 {
-    if text_len == 0 { return 0.0; }
+    if text_len == 0 {
+        return 0.0;
+    }
     let text_ratio = text_len as f32 / html_len.max(1) as f32;
     let mut score = (text_ratio * 5.0).min(1.0) * 0.4;
     score += (text_len as f32 / 5000.0).min(1.0) * 0.3;
     score += if title_len > 5 { 0.15 } else { 0.0 };
-    score += if links_len > 0 && links_len < 50 { 0.15 } else { 0.0 };
+    score += if links_len > 0 && links_len < 50 {
+        0.15
+    } else {
+        0.0
+    };
     score.min(1.0)
 }
 
@@ -366,10 +403,20 @@ pub fn extract(html: &str, url: &str) -> Result<CleanDoc> {
         {
             (fb_title, fallback_md, fallback_clean, fb_text)
         } else {
-            (raw_title, markdown_primary, clean_html_primary, text_primary)
+            (
+                raw_title,
+                markdown_primary,
+                clean_html_primary,
+                text_primary,
+            )
         }
     } else {
-        (raw_title, markdown_primary, clean_html_primary, text_primary)
+        (
+            raw_title,
+            markdown_primary,
+            clean_html_primary,
+            text_primary,
+        )
     };
 
     // Post-check: even when we didn't fallback, if markdown is still table garbage, fix it
@@ -414,7 +461,10 @@ mod tests {
             "real body text ".repeat(40)
         );
         let d = super::extract(&html, "https://example.com/a").unwrap();
-        assert!(!d.clean_html.contains("<script"), "script survived sanitizer");
+        assert!(
+            !d.clean_html.contains("<script"),
+            "script survived sanitizer"
+        );
         assert!(d.markdown.contains("real body text"));
         assert!(d.text.contains("real body text"));
     }
@@ -428,8 +478,17 @@ mod tests {
         }
         html.push_str("</body></html>");
         let d = super::extract(&html, "https://news.ycombinator.com").unwrap();
-        assert!(d.links.len() >= 20, "should extract many links, got {}", d.links.len());
-        assert!(d.page_type == "list" || d.markdown.len() > 500, "should be list or have substantial markdown, got type={} len={}", d.page_type, d.markdown.len());
+        assert!(
+            d.links.len() >= 20,
+            "should extract many links, got {}",
+            d.links.len()
+        );
+        assert!(
+            d.page_type == "list" || d.markdown.len() > 500,
+            "should be list or have substantial markdown, got type={} len={}",
+            d.page_type,
+            d.markdown.len()
+        );
     }
 
     #[test]
@@ -451,7 +510,11 @@ mod tests {
         assert_eq!(links[0].text.chars().count(), 100);
         let body = format!("<html><body>{}</body></html>", "中文テキスト ".repeat(500));
         let md = super::generate_link_markdown("T", &[], &body);
-        assert!(md.chars().count() < 2100, "snippet not capped: {}", md.chars().count());
+        assert!(
+            md.chars().count() < 2100,
+            "snippet not capped: {}",
+            md.chars().count()
+        );
     }
 
     #[test]
@@ -480,19 +543,35 @@ mod tests {
 
     #[test]
     fn clean_markdown_preserves_fenced_code() {
-        let md = "intro\n\n```rust\nfn main() {\n    let x   = 1;\n    ------\n}\n```\n\nafter   text";
+        let md =
+            "intro\n\n```rust\nfn main() {\n    let x   = 1;\n    ------\n}\n```\n\nafter   text";
         let out = super::clean_markdown(md);
-        assert!(out.contains("    let x   = 1;"), "aligned code collapsed: {out:?}");
-        assert!(out.contains("    ------"), "rule inside fence dropped: {out:?}");
-        assert!(out.contains("after text"), "prose runs not collapsed: {out:?}");
+        assert!(
+            out.contains("    let x   = 1;"),
+            "aligned code collapsed: {out:?}"
+        );
+        assert!(
+            out.contains("    ------"),
+            "rule inside fence dropped: {out:?}"
+        );
+        assert!(
+            out.contains("after text"),
+            "prose runs not collapsed: {out:?}"
+        );
     }
 
     #[test]
     fn clean_markdown_preserves_indented_code() {
         let md = "prose here\n\n    code    aligned\n    ------\n\nmore   prose";
         let out = super::clean_markdown(md);
-        assert!(out.contains("    code    aligned"), "indented code collapsed: {out:?}");
-        assert!(out.contains("    ------"), "rule in indented code dropped: {out:?}");
+        assert!(
+            out.contains("    code    aligned"),
+            "indented code collapsed: {out:?}"
+        );
+        assert!(
+            out.contains("    ------"),
+            "rule in indented code dropped: {out:?}"
+        );
         assert!(out.contains("more prose"));
     }
 

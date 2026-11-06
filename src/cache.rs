@@ -18,11 +18,7 @@ const TTL_SECS: u64 = 3600;
 static CACHE: OnceLock<Mutex<LruCache<String, (Instant, ScrapeResult)>>> = OnceLock::new();
 
 fn cache() -> &'static Mutex<LruCache<String, (Instant, ScrapeResult)>> {
-    CACHE.get_or_init(|| {
-        Mutex::new(LruCache::new(
-            NonZeroUsize::new(CAP).expect("CAP non-zero"),
-        ))
-    })
+    CACHE.get_or_init(|| Mutex::new(LruCache::new(NonZeroUsize::new(CAP).expect("CAP non-zero"))))
 }
 
 pub fn cache_key(url: &str, focus: Option<&str>, max_chars: usize) -> String {
@@ -63,7 +59,9 @@ pub fn cache_key_ext(
 }
 
 fn cache_file_path() -> PathBuf {
-    let base = std::env::var_os("HOME").map(PathBuf::from).unwrap_or_else(std::env::temp_dir);
+    let base = std::env::var_os("HOME")
+        .map(PathBuf::from)
+        .unwrap_or_else(std::env::temp_dir);
     base.join(".cache").join("scour").join("cache.json")
 }
 
@@ -194,8 +192,6 @@ pub fn cache_clear() {
     }
 }
 
-
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -203,8 +199,7 @@ mod tests {
 
     #[test]
     fn lru_eviction_order_is_true_lru() {
-        let mut lru: LruCache<String, u32> =
-            LruCache::new(NonZeroUsize::new(200).unwrap());
+        let mut lru: LruCache<String, u32> = LruCache::new(NonZeroUsize::new(200).unwrap());
         // Fill to capacity
         for i in 0..200 {
             lru.put(format!("k{i}"), i);

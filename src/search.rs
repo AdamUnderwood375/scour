@@ -11,9 +11,9 @@
 //! html endpoint rate-limits aggressively (HTTP 202 anomaly page); when it
 //! fails we retry once via the DDG lite endpoint.
 
+use crate::SearchHit;
 use crate::fetcher;
 use crate::normalize_url;
-use crate::SearchHit;
 use base64::Engine as _;
 use fs2::FileExt;
 use std::collections::HashMap;
@@ -64,7 +64,9 @@ fn now_ms() -> u64 {
 }
 
 fn engines_state_path() -> std::path::PathBuf {
-    let base = std::env::var_os("HOME").map(std::path::PathBuf::from).unwrap_or_else(std::env::temp_dir);
+    let base = std::env::var_os("HOME")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(std::env::temp_dir);
     base.join(".cache").join("scour").join("engines.json")
 }
 
@@ -120,7 +122,12 @@ fn update_state(engine: &str, f: impl FnOnce(&mut EngineState)) {
     if let Some(parent) = path.parent() {
         let _ = std::fs::create_dir_all(parent);
     }
-    let Ok(mut file) = std::fs::OpenOptions::new().read(true).write(true).create(true).truncate(false).open(&path)
+    let Ok(mut file) = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(&path)
     else {
         return;
     };
@@ -174,7 +181,11 @@ fn cooldown_bypass(states: &EngineStates, now: u64) -> Vec<String> {
     }
     let mut by_soonest: Vec<&str> = ENGINE_NAMES.to_vec();
     by_soonest.sort_by_key(|n| states.get(*n).map(|s| s.cooldown_until_ms).unwrap_or(0));
-    by_soonest.into_iter().take(2).map(|s| s.to_string()).collect()
+    by_soonest
+        .into_iter()
+        .take(2)
+        .map(|s| s.to_string())
+        .collect()
 }
 
 // ── selectors ───────────────────────────────────────────────────────────────
@@ -192,7 +203,10 @@ sel!(ddg_snippet_sel, ".result__snippet");
 sel!(a_href_sel, "a[href]");
 sel!(bing_algo_sel, "li.b_algo");
 sel!(bing_title_sel, "h2 a");
-sel!(bing_caption_sel, ".b_caption p, .b_lineclamp2, .b_lineclamp3, .b_lineclamp4");
+sel!(
+    bing_caption_sel,
+    ".b_caption p, .b_lineclamp2, .b_lineclamp3, .b_lineclamp4"
+);
 sel!(mojeek_result_sel, "ul.results-standard li");
 sel!(mojeek_title_sel, "a.title");
 sel!(mojeek_snippet_sel, "p.s");
@@ -216,7 +230,12 @@ sel!(yahoo_title_sel, "h3.title");
 sel!(yahoo_snippet_sel, "div.compText");
 
 fn text_of(el: scraper::ElementRef) -> String {
-    el.text().collect::<Vec<_>>().join(" ").split_whitespace().collect::<Vec<_>>().join(" ")
+    el.text()
+        .collect::<Vec<_>>()
+        .join(" ")
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
 }
 
 /// Host-level junk: engine self-links and ad redirects that must never surface.
@@ -224,7 +243,10 @@ fn is_junk_url(url: &str) -> bool {
     if url.contains("duckduckgo.com/y.js") {
         return true;
     }
-    let host = url::Url::parse(url).ok().and_then(|u| u.host_str().map(|s| s.to_lowercase())).unwrap_or_default();
+    let host = url::Url::parse(url)
+        .ok()
+        .and_then(|u| u.host_str().map(|s| s.to_lowercase()))
+        .unwrap_or_default();
     host.ends_with("bing.com")
         || host.ends_with("duckduckgo.com")
         || host.ends_with("mojeek.com")
@@ -235,7 +257,10 @@ fn is_junk_url(url: &str) -> bool {
 
 /// Lowercased host of a URL, or empty when it won't parse.
 fn host_of(url: &str) -> String {
-    url::Url::parse(url).ok().and_then(|u| u.host_str().map(|s| s.to_lowercase())).unwrap_or_default()
+    url::Url::parse(url)
+        .ok()
+        .and_then(|u| u.host_str().map(|s| s.to_lowercase()))
+        .unwrap_or_default()
 }
 
 /// True when `host` is `domain` or a subdomain of it. `domain` may carry a
@@ -243,7 +268,10 @@ fn host_of(url: &str) -> String {
 /// and `a.example.com` but not `notexample.com`.
 fn host_matches(host: &str, domain: &str) -> bool {
     let d = domain.trim().to_lowercase();
-    let d = d.trim_matches('.').trim_start_matches("www.").trim_matches('.');
+    let d = d
+        .trim_matches('.')
+        .trim_start_matches("www.")
+        .trim_matches('.');
     !d.is_empty() && (host == d || host.ends_with(&format!(".{d}")))
 }
 
@@ -251,7 +279,11 @@ fn push_hit(hits: &mut Vec<SearchHit>, title: String, url: String, snippet: Stri
     if title.is_empty() || !url.starts_with("http") || is_junk_url(&url) {
         return;
     }
-    hits.push(SearchHit { title, url, snippet });
+    hits.push(SearchHit {
+        title,
+        url,
+        snippet,
+    });
 }
 
 // ── per-engine parsers ──────────────────────────────────────────────────────
@@ -260,11 +292,17 @@ pub(crate) fn parse_ddg(html: &str) -> Vec<SearchHit> {
     let doc = scraper::Html::parse_document(html);
     let mut hits = Vec::new();
     for result in doc.select(ddg_result_sel()) {
-        let Some(title_el) = result.select(ddg_title_sel()).next() else { continue };
+        let Some(title_el) = result.select(ddg_title_sel()).next() else {
+            continue;
+        };
         let title = text_of(title_el);
         let href = title_el.value().attr("href").unwrap_or("");
         let url = resolve_ddg_href(href);
-        let snippet = result.select(ddg_snippet_sel()).next().map(text_of).unwrap_or_default();
+        let snippet = result
+            .select(ddg_snippet_sel())
+            .next()
+            .map(text_of)
+            .unwrap_or_default();
         push_hit(&mut hits, title, url, snippet);
     }
     if hits.is_empty() {
@@ -297,10 +335,16 @@ pub(crate) fn parse_bing(html: &str) -> Vec<SearchHit> {
     let doc = scraper::Html::parse_document(html);
     let mut hits = Vec::new();
     for algo in doc.select(bing_algo_sel()) {
-        let Some(a) = algo.select(bing_title_sel()).next() else { continue };
+        let Some(a) = algo.select(bing_title_sel()).next() else {
+            continue;
+        };
         let title = text_of(a);
         let url = decode_bing_href(a.value().attr("href").unwrap_or(""));
-        let snippet = algo.select(bing_caption_sel()).next().map(text_of).unwrap_or_default();
+        let snippet = algo
+            .select(bing_caption_sel())
+            .next()
+            .map(text_of)
+            .unwrap_or_default();
         push_hit(&mut hits, title, url, snippet);
     }
     hits
@@ -323,7 +367,11 @@ pub(crate) fn decode_bing_href(href: &str) -> String {
     match base64::engine::general_purpose::URL_SAFE_NO_PAD.decode(b64) {
         Ok(bytes) => {
             let s = String::from_utf8_lossy(&bytes).into_owned();
-            if s.starts_with("http") { s } else { href.to_string() }
+            if s.starts_with("http") {
+                s
+            } else {
+                href.to_string()
+            }
         }
         Err(_) => href.to_string(),
     }
@@ -333,10 +381,20 @@ pub(crate) fn parse_yahoo(html: &str) -> Vec<SearchHit> {
     let doc = scraper::Html::parse_document(html);
     let mut hits = Vec::new();
     for res in doc.select(yahoo_result_sel()) {
-        let Some(a) = res.select(yahoo_link_sel()).next() else { continue };
+        let Some(a) = res.select(yahoo_link_sel()).next() else {
+            continue;
+        };
         let url = decode_yahoo_href(a.value().attr("href").unwrap_or(""));
-        let title = res.select(yahoo_title_sel()).next().map(text_of).unwrap_or_else(|| text_of(a));
-        let snippet = res.select(yahoo_snippet_sel()).next().map(text_of).unwrap_or_default();
+        let title = res
+            .select(yahoo_title_sel())
+            .next()
+            .map(text_of)
+            .unwrap_or_else(|| text_of(a));
+        let snippet = res
+            .select(yahoo_snippet_sel())
+            .next()
+            .map(text_of)
+            .unwrap_or_default();
         push_hit(&mut hits, title, url, snippet);
     }
     hits
@@ -390,10 +448,16 @@ pub(crate) fn parse_mojeek(html: &str) -> Vec<SearchHit> {
     let doc = scraper::Html::parse_document(html);
     let mut hits = Vec::new();
     for li in doc.select(mojeek_result_sel()) {
-        let Some(a) = li.select(mojeek_title_sel()).next() else { continue };
+        let Some(a) = li.select(mojeek_title_sel()).next() else {
+            continue;
+        };
         let title = text_of(a);
         let url = a.value().attr("href").unwrap_or("").trim().to_string();
-        let snippet = li.select(mojeek_snippet_sel()).next().map(text_of).unwrap_or_default();
+        let snippet = li
+            .select(mojeek_snippet_sel())
+            .next()
+            .map(text_of)
+            .unwrap_or_default();
         push_hit(&mut hits, title, url, snippet);
     }
     hits
@@ -406,10 +470,20 @@ pub(crate) fn parse_brave(html: &str) -> Vec<SearchHit> {
     let doc = scraper::Html::parse_document(html);
     let mut hits = Vec::new();
     for res in doc.select(brave_result_sel()) {
-        let Some(a) = res.select(a_href_sel()).next() else { continue };
+        let Some(a) = res.select(a_href_sel()).next() else {
+            continue;
+        };
         let url = a.value().attr("href").unwrap_or("").trim().to_string();
-        let title = res.select(brave_title_sel()).next().map(text_of).unwrap_or_else(|| text_of(a));
-        let snippet = res.select(brave_snippet_sel()).next().map(text_of).unwrap_or_default();
+        let title = res
+            .select(brave_title_sel())
+            .next()
+            .map(text_of)
+            .unwrap_or_else(|| text_of(a));
+        let snippet = res
+            .select(brave_snippet_sel())
+            .next()
+            .map(text_of)
+            .unwrap_or_default();
         push_hit(&mut hits, title, url, snippet);
     }
     hits
@@ -450,13 +524,17 @@ pub(crate) fn detect_block(html: &str) -> Option<&'static str> {
     if h.contains("anomaly.js") || h.contains("/anomaly") {
         return Some("anomaly");
     }
-    if h.contains("/cdn-cgi/challenge") || h.contains("challenge-platform") || h.contains("cf-chl") {
+    if h.contains("/cdn-cgi/challenge") || h.contains("challenge-platform") || h.contains("cf-chl")
+    {
         return Some("cloudflare");
     }
     if h.contains("g-recaptcha") || h.contains("recaptcha/api") || h.contains("hcaptcha") {
         return Some("captcha");
     }
-    if h.contains("unusual traffic") || h.contains("are you a robot") || h.contains("verify you are a human") {
+    if h.contains("unusual traffic")
+        || h.contains("are you a robot")
+        || h.contains("verify you are a human")
+    {
         return Some("captcha");
     }
     None
@@ -468,7 +546,10 @@ pub(crate) fn detect_block(html: &str) -> Option<&'static str> {
 /// reported as `blocked:*` (the caller opens a cooldown on those). Transient 5xx
 /// and other non-200s become `error:http<status>` with no cooldown, so one flaky
 /// 502/503 never blacks out an engine for minutes.
-fn classify(resp: Option<(u16, String)>, parse: impl Fn(&str) -> Vec<SearchHit>) -> (Vec<SearchHit>, String) {
+fn classify(
+    resp: Option<(u16, String)>,
+    parse: impl Fn(&str) -> Vec<SearchHit>,
+) -> (Vec<SearchHit>, String) {
     match resp {
         None => (Vec::new(), "timeout".into()),
         Some((status, body)) => {
@@ -496,15 +577,17 @@ fn classify(resp: Option<(u16, String)>, parse: impl Fn(&str) -> Vec<SearchHit>)
 // ── ranking ─────────────────────────────────────────────────────────────────
 
 const STOPWORDS: &[&str] = &[
-    "vs", "versus", "and", "or", "the", "a", "an", "of", "to", "for", "in", "on",
-    "with", "is", "are", "how", "what", "why", "best", "using", "use",
+    "vs", "versus", "and", "or", "the", "a", "an", "of", "to", "for", "in", "on", "with", "is",
+    "are", "how", "what", "why", "best", "using", "use",
 ];
 
 /// Distinct, lowercased query terms, minus stopwords and bare years/numbers.
 fn query_terms(query: &str) -> Vec<String> {
     let mut terms: Vec<String> = Vec::new();
     for raw in query.split_whitespace() {
-        let t = raw.trim_matches(|c: char| !c.is_alphanumeric()).to_lowercase();
+        let t = raw
+            .trim_matches(|c: char| !c.is_alphanumeric())
+            .to_lowercase();
         if t.len() < 2 || STOPWORDS.contains(&t.as_str()) {
             continue;
         }
@@ -518,10 +601,20 @@ fn query_terms(query: &str) -> Vec<String> {
     terms
 }
 
-const DEMOTE_HOSTS: &[&str] = &["youtube.com", "youtu.be", "pinterest.", "facebook.com", "tiktok.com", "quora.com"];
+const DEMOTE_HOSTS: &[&str] = &[
+    "youtube.com",
+    "youtu.be",
+    "pinterest.",
+    "facebook.com",
+    "tiktok.com",
+    "quora.com",
+];
 
 fn is_demoted(url: &str) -> bool {
-    let host = url::Url::parse(url).ok().and_then(|u| u.host_str().map(|s| s.to_lowercase())).unwrap_or_default();
+    let host = url::Url::parse(url)
+        .ok()
+        .and_then(|u| u.host_str().map(|s| s.to_lowercase()))
+        .unwrap_or_default();
     DEMOTE_HOSTS.iter().any(|d| host.contains(d))
 }
 
@@ -570,7 +663,10 @@ fn fuse_and_rank(engine_hits: Vec<Vec<SearchHit>>, terms: &[String]) -> Vec<Sear
     let aggs: Vec<Agg> = order.into_iter().filter_map(|k| map.remove(&k)).collect();
     // Precompute each hit's score once, then sort — don't rebuild haystacks inside
     // the comparator.
-    let mut scored: Vec<(f32, SearchHit)> = aggs.into_iter().map(|a| (score(&a, terms), a.hit)).collect();
+    let mut scored: Vec<(f32, SearchHit)> = aggs
+        .into_iter()
+        .map(|a| (score(&a, terms), a.hit))
+        .collect();
     scored.sort_by(|a, b| b.0.total_cmp(&a.0));
     scored.into_iter().map(|(_, h)| h).collect()
 }
@@ -589,7 +685,12 @@ fn score(a: &Agg, terms: &[String]) -> f32 {
 
 /// Pace one engine (sleep so it's >= PACE_MS since its last cross-process
 /// request), record the request, then fetch with the per-engine timeout.
-async fn fetch_paced(client: &reqwest::Client, name: &str, url: String, last_ms: u64) -> Option<(u16, String)> {
+async fn fetch_paced(
+    client: &reqwest::Client,
+    name: &str,
+    url: String,
+    last_ms: u64,
+) -> Option<(u16, String)> {
     let sl = pace_sleep_ms(last_ms, now_ms());
     if sl > 0 {
         tokio::time::sleep(Duration::from_millis(sl)).await;
@@ -601,7 +702,10 @@ async fn fetch_paced(client: &reqwest::Client, name: &str, url: String, last_ms:
         let body = resp.text().await.ok()?;
         Some((status, body))
     };
-    tokio::time::timeout(ENGINE_TIMEOUT, fut).await.ok().flatten()
+    tokio::time::timeout(ENGINE_TIMEOUT, fut)
+        .await
+        .ok()
+        .flatten()
 }
 
 /// Run one engine end-to-end: honor cooldown, pace, fetch, classify, and open a
@@ -677,8 +781,13 @@ pub(crate) async fn search_run(
     // always make a live attempt instead of bailing "all failed" offline.
     let bypass = cooldown_bypass(&states, now);
     let bypassed = |name: &str| bypass.iter().any(|b| b == name);
-    let cooled =
-        |name: &str| states.get(name).map(|s| in_cooldown(s, now)).unwrap_or(false) && !bypassed(name);
+    let cooled = |name: &str| {
+        states
+            .get(name)
+            .map(|s| in_cooldown(s, now))
+            .unwrap_or(false)
+            && !bypassed(name)
+    };
     let last_of = |name: &str| states.get(name).map(|s| s.last_ms).unwrap_or(0);
 
     // DDG: pace + cooldown under the shared "ddg" slot, with a lite fallback when
@@ -689,7 +798,10 @@ pub(crate) async fn search_run(
         if cooled("ddg") {
             return (Vec::new(), "ddg:skipped:cooldown".to_string());
         }
-        let (hits, status) = classify(fetch_paced(client, "ddg", ddg_url, last_of("ddg")).await, parse_ddg);
+        let (hits, status) = classify(
+            fetch_paced(client, "ddg", ddg_url, last_of("ddg")).await,
+            parse_ddg,
+        );
         if status.starts_with("ok") {
             return (hits, format!("ddg:{status}{sfx}"));
         }
@@ -697,7 +809,10 @@ pub(crate) async fn search_run(
             set_cooldown("ddg");
         }
         // Lite fallback shares the ddg slot; last_ms=0 skips a second sleep.
-        let (lhits, lstatus) = classify(fetch_paced(client, "ddg", lite_url, 0).await, parse_ddg_lite);
+        let (lhits, lstatus) = classify(
+            fetch_paced(client, "ddg", lite_url, 0).await,
+            parse_ddg_lite,
+        );
         if lstatus.starts_with("ok") {
             (lhits, format!("ddg-lite:{lstatus}{sfx}"))
         } else {
@@ -707,10 +822,42 @@ pub(crate) async fn search_run(
 
     let (ddg_r, bing_r, brave_r, mojeek_r, yahoo_r) = tokio::join!(
         ddg_task,
-        run_engine(client, "bing", bing_url, parse_bing, cooled("bing"), bypassed("bing"), last_of("bing")),
-        run_engine(client, "brave", brave_url, parse_brave, cooled("brave"), bypassed("brave"), last_of("brave")),
-        run_engine(client, "mojeek", mojeek_url, parse_mojeek, cooled("mojeek"), bypassed("mojeek"), last_of("mojeek")),
-        run_engine(client, "yahoo", yahoo_url, parse_yahoo, cooled("yahoo"), bypassed("yahoo"), last_of("yahoo")),
+        run_engine(
+            client,
+            "bing",
+            bing_url,
+            parse_bing,
+            cooled("bing"),
+            bypassed("bing"),
+            last_of("bing")
+        ),
+        run_engine(
+            client,
+            "brave",
+            brave_url,
+            parse_brave,
+            cooled("brave"),
+            bypassed("brave"),
+            last_of("brave")
+        ),
+        run_engine(
+            client,
+            "mojeek",
+            mojeek_url,
+            parse_mojeek,
+            cooled("mojeek"),
+            bypassed("mojeek"),
+            last_of("mojeek")
+        ),
+        run_engine(
+            client,
+            "yahoo",
+            yahoo_url,
+            parse_yahoo,
+            cooled("yahoo"),
+            bypassed("yahoo"),
+            last_of("yahoo")
+        ),
     );
 
     let engines = vec![
@@ -728,7 +875,10 @@ pub(crate) async fn search_run(
     }
 
     let terms = query_terms(query);
-    let mut merged = fuse_and_rank(vec![ddg_r.0, bing_r.0, brave_r.0, mojeek_r.0, yahoo_r.0], &terms);
+    let mut merged = fuse_and_rank(
+        vec![ddg_r.0, bing_r.0, brave_r.0, mojeek_r.0, yahoo_r.0],
+        &terms,
+    );
 
     if let Some(s) = site
         && !s.trim().is_empty()
@@ -770,7 +920,12 @@ fn drop_zero_coverage(merged: &mut Vec<SearchHit>, terms: &[String]) {
 /// Low-relevance signal: warn when the best hit covers < half the distinct query
 /// terms, or fewer than 2 engines returned results. Returns the human-readable
 /// warning string (also surfaced as `<!-- warning: … -->` and in --json).
-fn low_relevance_warning(merged: &[SearchHit], terms: &[String], engines: &[String], ok_count: usize) -> Option<String> {
+fn low_relevance_warning(
+    merged: &[SearchHit],
+    terms: &[String],
+    engines: &[String],
+    ok_count: usize,
+) -> Option<String> {
     if terms.is_empty() {
         return None;
     }
@@ -824,10 +979,14 @@ mod tests {
     #[test]
     fn bing_ck_decode() {
         // base64url(no pad) of https://github.com/tokio-rs/axum
-        let href = "https://www.bing.com/ck/a?!&&p=xx&u=a1aHR0cHM6Ly9naXRodWIuY29tL3Rva2lvLXJzL2F4dW0";
+        let href =
+            "https://www.bing.com/ck/a?!&&p=xx&u=a1aHR0cHM6Ly9naXRodWIuY29tL3Rva2lvLXJzL2F4dW0";
         assert_eq!(decode_bing_href(href), "https://github.com/tokio-rs/axum");
         // non-ck passes through
-        assert_eq!(decode_bing_href("https://example.com/x"), "https://example.com/x");
+        assert_eq!(
+            decode_bing_href("https://example.com/x"),
+            "https://example.com/x"
+        );
     }
 
     #[test]
@@ -837,7 +996,10 @@ mod tests {
         assert!(hits.len() >= 2, "got {}", hits.len());
         assert!(hits.iter().all(|h| h.url.starts_with("http")));
         assert!(hits.iter().all(|h| !is_junk_url(&h.url)));
-        assert!(hits.iter().any(|h| !h.snippet.is_empty()), "expected snippets");
+        assert!(
+            hits.iter().any(|h| !h.snippet.is_empty()),
+            "expected snippets"
+        );
     }
 
     #[test]
@@ -845,8 +1007,14 @@ mod tests {
         let html = include_str!("../tests/fixtures/bing.html");
         let hits = parse_bing(html);
         assert!(hits.len() >= 2, "got {}", hits.len());
-        assert!(hits.iter().all(|h| !h.url.contains("bing.com")), "ck/a not decoded");
-        assert!(hits.iter().any(|h| !h.snippet.is_empty()), "expected snippets");
+        assert!(
+            hits.iter().all(|h| !h.url.contains("bing.com")),
+            "ck/a not decoded"
+        );
+        assert!(
+            hits.iter().any(|h| !h.snippet.is_empty()),
+            "expected snippets"
+        );
     }
 
     #[test]
@@ -855,9 +1023,18 @@ mod tests {
         let hits = parse_brave(html);
         assert!(hits.len() >= 4, "got {}", hits.len());
         assert!(hits.iter().all(|h| h.url.starts_with("http")));
-        assert!(hits.iter().all(|h| !h.url.contains("brave.com")), "internal brave link leaked");
-        assert_eq!(hits[0].url, "https://docs.rs/tokio/latest/tokio/macro.select.html");
-        assert!(hits.iter().any(|h| !h.snippet.is_empty()), "expected snippets");
+        assert!(
+            hits.iter().all(|h| !h.url.contains("brave.com")),
+            "internal brave link leaked"
+        );
+        assert_eq!(
+            hits[0].url,
+            "https://docs.rs/tokio/latest/tokio/macro.select.html"
+        );
+        assert!(
+            hits.iter().any(|h| !h.snippet.is_empty()),
+            "expected snippets"
+        );
     }
 
     #[test]
@@ -866,9 +1043,18 @@ mod tests {
         let hits = parse_ddg_lite(html);
         assert_eq!(hits.len(), 3, "got {}", hits.len());
         // uddg redirect must be decoded to the real target.
-        assert_eq!(hits[0].url, "https://docs.rs/tokio/latest/tokio/macro.select.html");
-        assert!(hits.iter().all(|h| !h.url.contains("duckduckgo.com")), "redirect not resolved");
-        assert!(hits.iter().all(|h| !h.snippet.is_empty()), "expected snippets");
+        assert_eq!(
+            hits[0].url,
+            "https://docs.rs/tokio/latest/tokio/macro.select.html"
+        );
+        assert!(
+            hits.iter().all(|h| !h.url.contains("duckduckgo.com")),
+            "redirect not resolved"
+        );
+        assert!(
+            hits.iter().all(|h| !h.snippet.is_empty()),
+            "expected snippets"
+        );
     }
 
     #[test]
@@ -878,12 +1064,27 @@ mod tests {
         let html = include_str!("../tests/fixtures/ddglite_nosnippet.html");
         let hits = parse_ddg_lite(html);
         assert_eq!(hits.len(), 3, "got {}", hits.len());
-        assert_eq!(hits[0].url, "https://docs.rs/tokio/latest/tokio/macro.select.html");
-        assert!(hits[0].snippet.contains("aggregates"), "got {:?}", hits[0].snippet);
+        assert_eq!(
+            hits[0].url,
+            "https://docs.rs/tokio/latest/tokio/macro.select.html"
+        );
+        assert!(
+            hits[0].snippet.contains("aggregates"),
+            "got {:?}",
+            hits[0].snippet
+        );
         assert_eq!(hits[1].url, "https://tokio.rs/tokio/tutorial/select");
-        assert!(hits[1].snippet.is_empty(), "2nd result should have no snippet, got {:?}", hits[1].snippet);
+        assert!(
+            hits[1].snippet.is_empty(),
+            "2nd result should have no snippet, got {:?}",
+            hits[1].snippet
+        );
         assert_eq!(hits[2].url, "https://github.com/tokio-rs/tokio");
-        assert!(hits[2].snippet.contains("reliable"), "got {:?}", hits[2].snippet);
+        assert!(
+            hits[2].snippet.contains("reliable"),
+            "got {:?}",
+            hits[2].snippet
+        );
     }
 
     #[test]
@@ -904,14 +1105,35 @@ mod tests {
         let blocked = include_str!("../tests/fixtures/ddglite_blocked.html");
         assert_eq!(detect_block(blocked), Some("anomaly"));
         // Real result pages are not flagged.
-        assert_eq!(detect_block(include_str!("../tests/fixtures/brave.html")), None);
-        assert_eq!(detect_block(include_str!("../tests/fixtures/ddglite.html")), None);
+        assert_eq!(
+            detect_block(include_str!("../tests/fixtures/brave.html")),
+            None
+        );
+        assert_eq!(
+            detect_block(include_str!("../tests/fixtures/ddglite.html")),
+            None
+        );
         // Status-based classification.
         assert_eq!(classify(None, parse_brave).1, "timeout");
-        assert_eq!(classify(Some((202, String::new())), parse_brave).1, "blocked:http202");
-        assert_eq!(classify(Some((200, blocked.to_string())), parse_ddg_lite).1, "blocked:anomaly");
-        assert_eq!(classify(Some((200, "<html></html>".into())), parse_brave).1, "empty");
-        let (hits, st) = classify(Some((200, include_str!("../tests/fixtures/ddglite.html").to_string())), parse_ddg_lite);
+        assert_eq!(
+            classify(Some((202, String::new())), parse_brave).1,
+            "blocked:http202"
+        );
+        assert_eq!(
+            classify(Some((200, blocked.to_string())), parse_ddg_lite).1,
+            "blocked:anomaly"
+        );
+        assert_eq!(
+            classify(Some((200, "<html></html>".into())), parse_brave).1,
+            "empty"
+        );
+        let (hits, st) = classify(
+            Some((
+                200,
+                include_str!("../tests/fixtures/ddglite.html").to_string(),
+            )),
+            parse_ddg_lite,
+        );
         assert_eq!(st, "ok:3");
         assert_eq!(hits.len(), 3);
     }
@@ -942,7 +1164,11 @@ mod tests {
             snippet: "a town".into(),
         };
         let out = fuse_and_rank(
-            vec![vec![wiki.clone()], vec![wiki.clone()], vec![wiki.clone(), compare.clone()]],
+            vec![
+                vec![wiki.clone()],
+                vec![wiki.clone()],
+                vec![wiki.clone(), compare.clone()],
+            ],
             &terms,
         );
         assert_eq!(out[0].url, compare.url, "full-coverage hit must rank first");
@@ -960,14 +1186,23 @@ mod tests {
         // Partway through the window ⇒ sleep the remainder.
         assert_eq!(pace_sleep_ms(1_000, 1_100), PACE_MS - 100);
         // Never sleep longer than the cap even with a tiny gap.
-        assert_eq!(pace_sleep_ms(1_000, 1_001), PACE_MAX_SLEEP_MS.min(PACE_MS - 1));
+        assert_eq!(
+            pace_sleep_ms(1_000, 1_001),
+            PACE_MAX_SLEEP_MS.min(PACE_MS - 1)
+        );
     }
 
     #[test]
     fn cooldown_skip_and_duration() {
         let now = 1_000_000;
-        let active = EngineState { last_ms: 0, cooldown_until_ms: now + 5_000 };
-        let expired = EngineState { last_ms: 0, cooldown_until_ms: now - 1 };
+        let active = EngineState {
+            last_ms: 0,
+            cooldown_until_ms: now + 5_000,
+        };
+        let expired = EngineState {
+            last_ms: 0,
+            cooldown_until_ms: now - 1,
+        };
         assert!(in_cooldown(&active, now));
         assert!(!in_cooldown(&expired, now));
         assert!(!in_cooldown(&EngineState::default(), now));
@@ -981,7 +1216,10 @@ mod tests {
     #[test]
     fn cooldown_bypass_picks_soonest() {
         let now = 1_000_000;
-        let mk = |until: u64| EngineState { last_ms: 0, cooldown_until_ms: until };
+        let mk = |until: u64| EngineState {
+            last_ms: 0,
+            cooldown_until_ms: until,
+        };
         let mut states = EngineStates::new();
         states.insert("ddg".into(), mk(now + 9_000));
         states.insert("bing".into(), mk(now + 1_000));
@@ -989,7 +1227,10 @@ mod tests {
         states.insert("mojeek".into(), mk(now + 8_000));
         states.insert("yahoo".into(), mk(now + 5_000));
         // All cooled ⇒ force-run the 2 soonest-expiring.
-        assert_eq!(cooldown_bypass(&states, now), vec!["bing".to_string(), "brave".to_string()]);
+        assert_eq!(
+            cooldown_bypass(&states, now),
+            vec!["bing".to_string(), "brave".to_string()]
+        );
         // One engine already available ⇒ no bypass.
         states.insert("yahoo".into(), mk(now - 1));
         assert!(cooldown_bypass(&states, now).is_empty());
@@ -1035,9 +1276,18 @@ mod tests {
         assert!(hits.len() >= 3, "got {}", hits.len());
         // RU= redirect decoded to the real target, no yahoo redirect host leaks.
         assert!(hits.iter().all(|h| h.url.starts_with("http")));
-        assert!(hits.iter().all(|h| !h.url.contains("search.yahoo.com")), "RU not decoded");
-        assert!(hits.iter().any(|h| !h.snippet.is_empty()), "expected snippets");
-        assert!(hits.iter().any(|h| h.title.to_lowercase().contains("axum")), "expected on-topic titles");
+        assert!(
+            hits.iter().all(|h| !h.url.contains("search.yahoo.com")),
+            "RU not decoded"
+        );
+        assert!(
+            hits.iter().any(|h| !h.snippet.is_empty()),
+            "expected snippets"
+        );
+        assert!(
+            hits.iter().any(|h| h.title.to_lowercase().contains("axum")),
+            "expected on-topic titles"
+        );
     }
 
     #[test]
@@ -1045,20 +1295,31 @@ mod tests {
         let href = "https://r.search.yahoo.com/_ylt=A0;_ylu=X3/RU=https%3a%2f%2fgithub.com%2ftokio-rs%2faxum/RK=2/RS=abc";
         assert_eq!(decode_yahoo_href(href), "https://github.com/tokio-rs/axum");
         // non-redirect passes through unchanged.
-        assert_eq!(decode_yahoo_href("https://example.com/x"), "https://example.com/x");
+        assert_eq!(
+            decode_yahoo_href("https://example.com/x"),
+            "https://example.com/x"
+        );
     }
 
     #[test]
     fn low_relevance_warning_fires() {
         let terms = query_terms("axum vs actix web 2025"); // axum, actix, web
         // Top hit covers only 1/3 terms ⇒ warn, and report 1/3.
-        let weak = vec![SearchHit { title: "Axum town".into(), url: "https://x.com/a".into(), snippet: "ethiopia".into() }];
+        let weak = vec![SearchHit {
+            title: "Axum town".into(),
+            url: "https://x.com/a".into(),
+            snippet: "ethiopia".into(),
+        }];
         let engines = vec!["bing:ok:7".into(), "yahoo:ok:7".into()];
         let w = low_relevance_warning(&weak, &terms, &engines, 2).expect("warn");
         assert!(w.contains("1/3"), "{w}");
         assert!(w.contains("bing:ok:7,yahoo:ok:7"), "{w}");
         // Strong coverage + 2 ok engines ⇒ no warning.
-        let strong = vec![SearchHit { title: "axum vs actix web".into(), url: "https://x.com/b".into(), snippet: "".into() }];
+        let strong = vec![SearchHit {
+            title: "axum vs actix web".into(),
+            url: "https://x.com/b".into(),
+            snippet: "".into(),
+        }];
         assert!(low_relevance_warning(&strong, &terms, &engines, 2).is_none());
         // Good coverage but only 1 ok engine ⇒ warn.
         assert!(low_relevance_warning(&strong, &terms, &engines, 1).is_some());
@@ -1067,8 +1328,17 @@ mod tests {
     #[test]
     fn zero_coverage_dropped_when_enough_signal() {
         let terms = query_terms("axum actix web");
-        let mk = |t: &str| SearchHit { title: t.into(), url: "https://x.com/".to_string() + t, snippet: String::new() };
-        let mut hits = vec![mk("axum"), mk("actix"), mk("web"), mk("unrelated video game")];
+        let mk = |t: &str| SearchHit {
+            title: t.into(),
+            url: "https://x.com/".to_string() + t,
+            snippet: String::new(),
+        };
+        let mut hits = vec![
+            mk("axum"),
+            mk("actix"),
+            mk("web"),
+            mk("unrelated video game"),
+        ];
         drop_zero_coverage(&mut hits, &terms);
         assert_eq!(hits.len(), 3, "zero-coverage junk should be dropped");
         assert!(hits.iter().all(|h| coverage(h, &terms) > 0.0));
@@ -1081,8 +1351,16 @@ mod tests {
     #[test]
     fn social_hosts_demoted() {
         let terms = query_terms("rust tokio select");
-        let article = SearchHit { title: "rust tokio select guide".into(), url: "https://docs.rs/tokio".into(), snippet: "select macro".into() };
-        let yt = SearchHit { title: "rust tokio select video".into(), url: "https://www.youtube.com/watch?v=x".into(), snippet: "select macro".into() };
+        let article = SearchHit {
+            title: "rust tokio select guide".into(),
+            url: "https://docs.rs/tokio".into(),
+            snippet: "select macro".into(),
+        };
+        let yt = SearchHit {
+            title: "rust tokio select video".into(),
+            url: "https://www.youtube.com/watch?v=x".into(),
+            snippet: "select macro".into(),
+        };
         // Same coverage & RRF; youtube demoted ⇒ article first.
         let out = fuse_and_rank(vec![vec![yt.clone()], vec![article.clone()]], &terms);
         assert_eq!(out[0].url, article.url);

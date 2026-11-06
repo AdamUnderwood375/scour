@@ -396,11 +396,18 @@ fn playwright_chromium() -> Option<std::path::PathBuf> {
         .ok()?
         .flatten()
         .map(|e| e.path())
-        .filter(|p| p.file_name().and_then(|n| n.to_str()).is_some_and(|n| n.starts_with("chromium-")))
+        .filter(|p| {
+            p.file_name()
+                .and_then(|n| n.to_str())
+                .is_some_and(|n| n.starts_with("chromium-"))
+        })
         .collect();
     dirs.sort();
     dirs.iter().rev().find_map(|d| {
-        ["chrome-linux64/chrome", "chrome-linux/chrome"].iter().map(|s| d.join(s)).find(|p| p.exists())
+        ["chrome-linux64/chrome", "chrome-linux/chrome"]
+            .iter()
+            .map(|s| d.join(s))
+            .find(|p| p.exists())
     })
 }
 
@@ -495,8 +502,10 @@ fn fetch_chrome_blocking(
 
 /// Fetch `url`, escalating to a real browser only when the cheap path is blocked.
 fn is_timeout_error(e: &anyhow::Error) -> bool {
-    e.chain()
-        .any(|c| c.downcast_ref::<reqwest::Error>().is_some_and(|r| r.is_timeout()))
+    e.chain().any(|c| {
+        c.downcast_ref::<reqwest::Error>()
+            .is_some_and(|r| r.is_timeout())
+    })
 }
 
 pub async fn fetch(url: &str) -> Result<Fetched> {
@@ -518,16 +527,17 @@ pub async fn fetch(url: &str) -> Result<Fetched> {
     let first_reason = cheap.as_ref().ok().and_then(|f| f.reason.clone());
     let u = url.to_string();
     // headless_chrome is sync; keep it off the async runtime's worker threads.
-    let (fetched, final_url) =
-        match tokio::task::spawn_blocking(move || fetch_chrome_blocking(&u, first_status, first_reason))
-            .await?
-        {
-            Ok(pair) => pair,
-            // Browser missing/unlaunchable: better to hand back the blocked cheap
-            // response (agent sees the challenge page, `blocked: true`) than to
-            // fail the call outright.
-            Err(e) => return cheap.map_err(|_| e),
-        };
+    let (fetched, final_url) = match tokio::task::spawn_blocking(move || {
+        fetch_chrome_blocking(&u, first_status, first_reason)
+    })
+    .await?
+    {
+        Ok(pair) => pair,
+        // Browser missing/unlaunchable: better to hand back the blocked cheap
+        // response (agent sees the challenge page, `blocked: true`) than to
+        // fail the call outright.
+        Err(e) => return cheap.map_err(|_| e),
+    };
     // Chrome may have followed redirects on its own; re-check where it landed
     // and discard the content if it ended on a non-public host.
     check_public_url(&final_url).await?;
@@ -548,8 +558,11 @@ mod tests {
         assert!(block_reason(403, &"x".repeat(9000)).is_some());
         assert!(block_reason(200, &pad("<html><title>Just a moment...</title></html>")).is_some());
         assert!(
-            block_reason(200, &pad("<script src='/cdn-cgi/challenge-platform/h/b/x'></script>"))
-                .is_some(),
+            block_reason(
+                200,
+                &pad("<script src='/cdn-cgi/challenge-platform/h/b/x'></script>")
+            )
+            .is_some(),
             "vendor infra path should be caught without any English copy"
         );
     }
@@ -597,13 +610,29 @@ mod tests {
     #[test]
     fn is_public_ip_v4() {
         for bad in [
-            "127.0.0.1", "10.0.0.1", "172.16.5.4", "192.168.1.1", "169.254.169.254",
-            "100.64.0.1", "0.0.0.0", "0.1.2.3", "255.255.255.255", "224.0.0.1",
-            "192.0.2.5", "198.51.100.5", "203.0.113.5",
+            "127.0.0.1",
+            "10.0.0.1",
+            "172.16.5.4",
+            "192.168.1.1",
+            "169.254.169.254",
+            "100.64.0.1",
+            "0.0.0.0",
+            "0.1.2.3",
+            "255.255.255.255",
+            "224.0.0.1",
+            "192.0.2.5",
+            "198.51.100.5",
+            "203.0.113.5",
         ] {
             assert!(!is_public_ip(ip(bad)), "{bad} should be non-public");
         }
-        for ok in ["8.8.8.8", "1.1.1.1", "100.63.255.255", "100.128.0.1", "93.184.216.34"] {
+        for ok in [
+            "8.8.8.8",
+            "1.1.1.1",
+            "100.63.255.255",
+            "100.128.0.1",
+            "93.184.216.34",
+        ] {
             assert!(is_public_ip(ip(ok)), "{ok} should be public");
         }
     }
@@ -622,7 +651,10 @@ mod tests {
     fn is_public_ip_v6_embedded_v4() {
         // NAT64 64:ff9b::/96 and 6to4 2002::/16 embed a v4 that must be judged
         // by the v4 ranges, or metadata/LAN hosts slip through.
-        assert!(!is_public_ip(ip("64:ff9b::a9fe:a9fe")), "NAT64 of 169.254.169.254");
+        assert!(
+            !is_public_ip(ip("64:ff9b::a9fe:a9fe")),
+            "NAT64 of 169.254.169.254"
+        );
         assert!(!is_public_ip(ip("2002:c0a8:0101::")), "6to4 of 192.168.1.1");
         assert!(is_public_ip(ip("2002:0808:0808::")), "6to4 of 8.8.8.8");
     }

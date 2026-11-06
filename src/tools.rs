@@ -20,7 +20,9 @@ const CRATES_UA: &str = concat!(
 
 /// Compact GitHub repo summary. `spec` is `owner/repo` or any github.com URL.
 pub async fn gh(spec: &str) -> Result<String> {
-    gh_with_readme(spec, false).await.map(|(summary, _)| summary)
+    gh_with_readme(spec, false)
+        .await
+        .map(|(summary, _)| summary)
 }
 
 /// Repo summary and, when `readme`, the cleaned README. The README is requested only after the
@@ -38,11 +40,18 @@ pub async fn gh_with_readme(spec: &str, readme: bool) -> Result<(String, Option<
     }
     let repo_json = json_of(&r.body, &base)?;
     let readme_fut = async {
-        if readme { Some(readme_body(&owner, &repo, auth.as_deref()).await) } else { None }
+        if readme {
+            Some(readme_body(&owner, &repo, auth.as_deref()).await)
+        } else {
+            None
+        }
     };
     // Only the repo call is fatal; release lookup failures just drop the line.
     let (release, readme_res) = tokio::join!(latest_release(&base, &headers), readme_fut);
-    Ok((format_gh(&repo_json, release.as_ref().map(|r| r.as_ref())), readme_res))
+    Ok((
+        format_gh(&repo_json, release.as_ref().map(|r| r.as_ref())),
+        readme_res,
+    ))
 }
 
 /// Cleaned README (`clean_readme`). Raw media type, so the body is markdown.
@@ -115,11 +124,15 @@ pub async fn pkg(registry: &str, name: &str) -> Result<String> {
             // best-effort, only when its top hit is this exact package.
             let latest = format!("https://registry.npmjs.org/{enc_name}/latest");
             let search = format!("https://registry.npmjs.org/-/v1/search?text={enc_name}&size=1");
-            let (v, found) = tokio::join!(fetch_json("npm", &latest, &[]), fetch_json("npm", &search, &[]));
+            let (v, found) = tokio::join!(
+                fetch_json("npm", &latest, &[]),
+                fetch_json("npm", &search, &[])
+            );
             let v = v?;
             let date = found.ok().and_then(|f| {
                 let p = &f["objects"][0]["package"];
-                (p["name"] == v["name"] && p["version"] == v["version"]).then(|| p["date"].as_str().map(String::from))?
+                (p["name"] == v["name"] && p["version"] == v["version"])
+                    .then(|| p["date"].as_str().map(String::from))?
             });
             Ok(format_npm(&v, date.as_deref()))
         }
@@ -366,7 +379,9 @@ fn badge_len(s: &str) -> Option<usize> {
     let tail = group_len(&s[alt_end..]);
     if !linked {
         // Reference image only: `![alt][ref]`.
-        return tail.filter(|_| s[alt_end..].starts_with('[')).map(|t| alt_end + t);
+        return tail
+            .filter(|_| s[alt_end..].starts_with('['))
+            .map(|t| alt_end + t);
     }
     // Linked: the image's own tail is optional (`[![alt]][ref]`), then `]` and the href tail.
     let mut n = alt_end + tail.unwrap_or(0);
@@ -393,7 +408,10 @@ fn unwrap_wrapper(line: &str) -> String {
     let Some(inner) = t.strip_prefix('<') else {
         return line.to_string();
     };
-    let name: String = inner.chars().take_while(char::is_ascii_alphanumeric).collect();
+    let name: String = inner
+        .chars()
+        .take_while(char::is_ascii_alphanumeric)
+        .collect();
     let name = name.to_ascii_lowercase();
     let close = format!("</{name}>");
     match t.find('>') {
@@ -453,7 +471,10 @@ fn is_markup_line(line: &str) -> bool {
                 None => return false,
             }
         } else if rest.starts_with("![") {
-            match rest.find("](").and_then(|j| rest[j..].find(')').map(|k| j + k + 1)) {
+            match rest
+                .find("](")
+                .and_then(|j| rest[j..].find(')').map(|k| j + k + 1))
+            {
                 Some(e) => &rest[e..],
                 None => return false,
             }
@@ -546,7 +567,10 @@ pub fn format_npm(v: &Value, published: Option<&str>) -> String {
     let license = s(v, "license").or(s(&v["license"], "type")).unwrap_or("?");
     let mut out = vec![format!("# {} {ver}", s(v, "name").unwrap_or("?"))];
     out.extend(s(v, "description").map(String::from));
-    out.push(format!("Published: {} · License: {license}", published.map_or("?", date)));
+    out.push(format!(
+        "Published: {} · License: {license}",
+        published.map_or("?", date)
+    ));
     out.extend(s(v, "name").map(|n| format!("Registry: https://www.npmjs.com/package/{n}")));
     let repo = s(v, "repository").or(s(&v["repository"], "url"));
     if let Some(r) = repo {
@@ -700,8 +724,14 @@ mod tests {
             "rate limited (secondary limit); set GITHUB_TOKEN"
         );
         let primary = r#"{"message":"API rate limit exceeded for 1.2.3.4"}"#;
-        assert_eq!(e(StatusCode::FORBIDDEN, primary, false), "rate limited; set GITHUB_TOKEN");
-        assert_eq!(e(StatusCode::FORBIDDEN, "", true), "rate limited; set GITHUB_TOKEN");
+        assert_eq!(
+            e(StatusCode::FORBIDDEN, primary, false),
+            "rate limited; set GITHUB_TOKEN"
+        );
+        assert_eq!(
+            e(StatusCode::FORBIDDEN, "", true),
+            "rate limited; set GITHUB_TOKEN"
+        );
         assert_eq!(
             e(StatusCode::FORBIDDEN, "Repository access blocked", false),
             "access denied (403)"
@@ -729,7 +759,8 @@ mod tests {
 
     #[test]
     fn crate_docs_fallback_to_docs_rs() {
-        let v = json!({"crate": {"name": "foo-bar", "max_version": "1.0.0", "documentation": null}});
+        let v =
+            json!({"crate": {"name": "foo-bar", "max_version": "1.0.0", "documentation": null}});
         let out = format_crate(&v);
         assert!(out.contains("Registry: https://crates.io/crates/foo-bar"));
         assert!(out.contains("Docs: https://docs.rs/foo-bar"));
@@ -809,9 +840,15 @@ mod tests {
 
     #[test]
     fn readme_cleaning_handles_inline_comment_and_empty() {
-        assert_eq!(clean_readme("a <!-- x --> b\n<!--\n\n-->\nc\n"), "a  b\n\nc");
+        assert_eq!(
+            clean_readme("a <!-- x --> b\n<!--\n\n-->\nc\n"),
+            "a  b\n\nc"
+        );
         assert_eq!(clean_readme("\n\n  \n"), "");
-        assert_eq!(clean_readme("[![Docs](https://d/b.svg)][docs]\n\nkeep"), "keep");
+        assert_eq!(
+            clean_readme("[![Docs](https://d/b.svg)][docs]\n\nkeep"),
+            "keep"
+        );
     }
 
     #[test]

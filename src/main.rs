@@ -14,13 +14,13 @@ mod search;
 mod tools;
 
 use cache::{cache_get, cache_key, cache_key_ext, cache_set};
-use search::search_run;
 use rmcp::{
     ErrorData, ServerHandler,
     handler::server::wrapper::{Json, Parameters},
     model::{ServerCapabilities, ServerInfo},
     schemars, tool, tool_handler, tool_router,
 };
+use search::search_run;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::net::IpAddr;
 use std::sync::OnceLock;
@@ -43,7 +43,9 @@ pub struct ScrapeOptions {
     #[schemars(description = "Include image URLs (extract <img src> via scraper)")]
     #[serde(default)]
     pub include_media: Option<bool>,
-    #[schemars(description = "Browser actions to perform before extraction (escalates to chrome: click, fill, press, wait, scroll)")]
+    #[schemars(
+        description = "Browser actions to perform before extraction (escalates to chrome: click, fill, press, wait, scroll)"
+    )]
     #[serde(default)]
     pub actions: Option<Vec<Action>>,
     #[schemars(description = "Page range for PDFs like \"1-3\"")]
@@ -233,7 +235,9 @@ pub struct GithubRepoRequest {
     #[schemars(description = "README excerpt cap in chars (default 1500)")]
     #[serde(default)]
     pub max_chars: Option<usize>,
-    #[schemars(description = "Return only the README paragraphs relevant to this query, best-first")]
+    #[schemars(
+        description = "Return only the README paragraphs relevant to this query, best-first"
+    )]
     #[serde(default)]
     pub focus: Option<String>,
 }
@@ -309,7 +313,9 @@ impl Scour {
             actions.as_deref(),
         )
         .await
-        .map_err(|e| ErrorData::internal_error(format!("scrape failed for {}: {e}", req.url), None))?;
+        .map_err(|e| {
+            ErrorData::internal_error(format!("scrape failed for {}: {e}", req.url), None)
+        })?;
         Ok(Json(doc))
     }
 
@@ -321,7 +327,10 @@ impl Scour {
         Parameters(req): Parameters<ScrapeBatchRequest>,
     ) -> Result<Json<BatchResult>, ErrorData> {
         if req.urls.is_empty() || req.urls.len() > 10 {
-            return Err(ErrorData::invalid_params("urls must be 1..10".to_string(), None));
+            return Err(ErrorData::invalid_params(
+                "urls must be 1..10".to_string(),
+                None,
+            ));
         }
         let focus = req.focus.clone();
         let max_chars = req.max_chars.unwrap_or(40_000);
@@ -348,7 +357,11 @@ impl Scour {
             }
             out.push(doc);
         }
-        Ok(Json(BatchResult { total: out.len(), ok_count: ok, results: out }))
+        Ok(Json(BatchResult {
+            total: out.len(),
+            ok_count: ok,
+            results: out,
+        }))
     }
 
     #[tool(
@@ -361,9 +374,20 @@ impl Scour {
         let max_pages = req.max_pages.unwrap_or(5).clamp(1, 20);
         let max_depth = req.max_depth.unwrap_or(2).min(4);
         let max_chars = req.max_chars.unwrap_or(8000);
-        let res = crawl_run(&req.url, max_pages, max_depth, req.focus.as_deref(), max_chars, req.sitemap, req.discover_only, req.max_total_chars)
-            .await
-            .map_err(|e| ErrorData::internal_error(format!("crawl failed for {}: {e}", req.url), None))?;
+        let res = crawl_run(
+            &req.url,
+            max_pages,
+            max_depth,
+            req.focus.as_deref(),
+            max_chars,
+            req.sitemap,
+            req.discover_only,
+            req.max_total_chars,
+        )
+        .await
+        .map_err(|e| {
+            ErrorData::internal_error(format!("crawl failed for {}: {e}", req.url), None)
+        })?;
         Ok(Json(res))
     }
 
@@ -373,7 +397,9 @@ impl Scour {
         Ok(Json(serde_json::json!({"cleared": true})))
     }
 
-    #[tool(description = "Look up a GitHub repo via the GitHub API (no HTML scraping; honors GITHUB_TOKEN for rate limits). Returns markdown: stars, language, latest release, description, and an optional focus-filtered README excerpt.")]
+    #[tool(
+        description = "Look up a GitHub repo via the GitHub API (no HTML scraping; honors GITHUB_TOKEN for rate limits). Returns markdown: stars, language, latest release, description, and an optional focus-filtered README excerpt."
+    )]
     async fn github_repo(
         &self,
         Parameters(req): Parameters<GithubRepoRequest>,
@@ -385,22 +411,28 @@ impl Scour {
             req.max_chars.unwrap_or(1500),
         )
         .await
-        .map_err(|e| ErrorData::internal_error(format!("github_repo failed for {}: {e}", req.repo), None))?;
+        .map_err(|e| {
+            ErrorData::internal_error(format!("github_repo failed for {}: {e}", req.repo), None)
+        })?;
         Ok(Json(TextResult { text }))
     }
 
-    #[tool(description = "Look up the latest package version via the registry APIs (crates.io / npm / PyPI; no HTML scraping, honors GITHUB_TOKEN where relevant). Returns markdown. `registry` accepts crates|npm|pypi and aliases.")]
+    #[tool(
+        description = "Look up the latest package version via the registry APIs (crates.io / npm / PyPI; no HTML scraping, honors GITHUB_TOKEN where relevant). Returns markdown. `registry` accepts crates|npm|pypi and aliases."
+    )]
     async fn package_info(
         &self,
         Parameters(req): Parameters<PackageInfoRequest>,
     ) -> Result<Json<TextResult>, ErrorData> {
-        let text = tools::pkg(&req.registry, &req.name)
-            .await
-            .map_err(|e| ErrorData::internal_error(format!("package_info failed for {}: {e}", req.name), None))?;
+        let text = tools::pkg(&req.registry, &req.name).await.map_err(|e| {
+            ErrorData::internal_error(format!("package_info failed for {}: {e}", req.name), None)
+        })?;
         Ok(Json(TextResult { text }))
     }
 
-    #[tool(description = "Search the web (keyless, fused across Bing, Yahoo, Brave, DuckDuckGo and Mojeek; paced with per-engine cooldowns, deduped and ranked). Returns title/url/snippet hits. Use before `scrape` to discover URLs. Supports site:, freshness, and exclude_sites filters.")]
+    #[tool(
+        description = "Search the web (keyless, fused across Bing, Yahoo, Brave, DuckDuckGo and Mojeek; paced with per-engine cooldowns, deduped and ranked). Returns title/url/snippet hits. Use before `scrape` to discover URLs. Supports site:, freshness, and exclude_sites filters."
+    )]
     async fn search(
         &self,
         Parameters(req): Parameters<SearchRequest>,
@@ -424,13 +456,19 @@ impl Scour {
         }))
     }
 
-    #[tool(description = "Screenshot a page via headless Chromium (Brave/Chrome/Chromium or Playwright's Chromium; SCOUR_BROWSER to override). Returns base64 PNG (truncated preview).")]
+    #[tool(
+        description = "Screenshot a page via headless Chromium (Brave/Chrome/Chromium or Playwright's Chromium; SCOUR_BROWSER to override). Returns base64 PNG (truncated preview)."
+    )]
     async fn screenshot(
         &self,
         Parameters(req): Parameters<ScrapeRequest>,
     ) -> Result<Json<serde_json::Value>, ErrorData> {
-        let png = screenshot_run(&req.url).await.map_err(|e| ErrorData::internal_error(format!("screenshot failed for {}: {e}", req.url), None))?;
-        Ok(Json(serde_json::json!({"url": req.url, "png_base64": png, "note": "truncated base64, decode to view"})))
+        let png = screenshot_run(&req.url).await.map_err(|e| {
+            ErrorData::internal_error(format!("screenshot failed for {}: {e}", req.url), None)
+        })?;
+        Ok(Json(
+            serde_json::json!({"url": req.url, "png_base64": png, "note": "truncated base64, decode to view"}),
+        ))
     }
 
     #[tool(description = "Version and build info.")]
@@ -521,7 +559,7 @@ impl Stats {
 fn validate(url: &str) -> anyhow::Result<()> {
     let u = url::Url::parse(url)?;
     match u.scheme() {
-        "http" | "https" => {},
+        "http" | "https" => {}
         s => anyhow::bail!("refusing non-http scheme: {s}"),
     }
     // Literal IPs only; hostnames are checked against resolved IPs in fetcher.
@@ -566,7 +604,10 @@ fn paragraphs(md: &str) -> Vec<&str> {
 fn focus_filter(markdown: &str, query: &str, keep: usize) -> Option<String> {
     let terms: Vec<String> = query
         .split_whitespace()
-        .map(|t| t.trim_matches(|c: char| !c.is_alphanumeric()).to_lowercase())
+        .map(|t| {
+            t.trim_matches(|c: char| !c.is_alphanumeric())
+                .to_lowercase()
+        })
         .filter(|t| t.len() > 2)
         .collect();
     if terms.is_empty() {
@@ -585,18 +626,26 @@ fn focus_filter(markdown: &str, query: &str, keep: usize) -> Option<String> {
         let mut score: f32 = 0.0;
         for (ti, term) in terms.iter().enumerate() {
             let tf = lower.matches(term).count() as f32;
-            if tf == 0.0 { continue; }
-            let idf = ((n - df[ti] as f32 + 0.5) / (df[ti] as f32 + 0.5) + 1.0).ln().max(0.1);
+            if tf == 0.0 {
+                continue;
+            }
+            let idf = ((n - df[ti] as f32 + 0.5) / (df[ti] as f32 + 0.5) + 1.0)
+                .ln()
+                .max(0.1);
             score += tf * idf;
         }
-        if score == 0.0 { continue; }
+        if score == 0.0 {
+            continue;
+        }
         let trimmed = para.trim_start();
         if trimmed.starts_with('#') {
             score *= 2.0;
         } else if trimmed.starts_with("##") || trimmed.starts_with("**") {
             score *= 1.5;
         }
-        if i < 3 { score *= 1.1; }
+        if i < 3 {
+            score *= 1.1;
+        }
         scored.push((score, i, *para));
     }
     if scored.is_empty() {
@@ -605,7 +654,13 @@ fn focus_filter(markdown: &str, query: &str, keep: usize) -> Option<String> {
     scored.sort_by(|a, b| b.0.total_cmp(&a.0));
     scored.truncate(keep);
     scored.sort_by_key(|(_, i, _)| *i);
-    Some(scored.into_iter().map(|(_, _, p)| p).collect::<Vec<_>>().join("\n\n"))
+    Some(
+        scored
+            .into_iter()
+            .map(|(_, _, p)| p)
+            .collect::<Vec<_>>()
+            .join("\n\n"),
+    )
 }
 
 /// The text `offset` and `max_chars` index into, its char count, and whether `focus` matched
@@ -632,7 +687,10 @@ fn truncate(md: &str, limit: usize) -> (String, bool) {
         return (md.to_string(), false);
     };
     // `end` is a char boundary, so the slice never splits a codepoint.
-    let cut = md[..end].rfind("\n\n").filter(|b| *b > end / 2).unwrap_or(end);
+    let cut = md[..end]
+        .rfind("\n\n")
+        .filter(|b| *b > end / 2)
+        .unwrap_or(end);
     (md[..cut].to_string(), true)
 }
 
@@ -688,16 +746,24 @@ fn extract_media(html: &str, base_url: &str) -> Vec<String> {
     for el in doc.select(sel) {
         if let Some(src) = el.value().attr("src") {
             let src = src.trim();
-            if src.is_empty() || src.starts_with("data:") { continue; }
+            if src.is_empty() || src.starts_with("data:") {
+                continue;
+            }
             let abs = if let Some(b) = &base {
-                b.join(src).map(|u| u.to_string()).unwrap_or_else(|_| src.to_string())
+                b.join(src)
+                    .map(|u| u.to_string())
+                    .unwrap_or_else(|_| src.to_string())
             } else {
                 src.to_string()
             };
-            if abs.len() > 2048 { continue; }
+            if abs.len() > 2048 {
+                continue;
+            }
             if seen.insert(abs.clone()) {
                 out.push(abs);
-                if out.len() >= 50 { break; }
+                if out.len() >= 50 {
+                    break;
+                }
             }
         }
     }
@@ -750,7 +816,9 @@ async fn pdf_text(bytes: Vec<u8>) -> Option<String> {
         let feeder = std::thread::spawn(move || stdin.write_all(&bytes));
         let out = child.wait_with_output().ok()?;
         let _ = feeder.join();
-        out.status.success().then(|| String::from_utf8_lossy(&out.stdout).into_owned())
+        out.status
+            .success()
+            .then(|| String::from_utf8_lossy(&out.stdout).into_owned())
     })
     .await
     .ok()
@@ -758,7 +826,14 @@ async fn pdf_text(bytes: Vec<u8>) -> Option<String> {
 }
 
 /// Result for a PDF body: its text layer, or `content_ok: false` when none could be read.
-async fn pdf_result(url: &str, bytes: Vec<u8>, pages: Option<&str>, focus: Option<&str>, max_chars: usize, offset: Option<usize>) -> ScrapeResult {
+async fn pdf_result(
+    url: &str,
+    bytes: Vec<u8>,
+    pages: Option<&str>,
+    focus: Option<&str>,
+    max_chars: usize,
+    offset: Option<usize>,
+) -> ScrapeResult {
     let size = bytes.len();
     let text = pdf_text(bytes).await.unwrap_or_default();
     let text = text.trim();
@@ -769,11 +844,19 @@ async fn pdf_result(url: &str, bytes: Vec<u8>, pages: Option<&str>, focus: Optio
     let (markdown, next_offset) = cut_page(&slice_at_offset(&focused, off), missed, off, max_chars);
     let truncated = next_offset.is_some();
     let (note, next_action) = if content_ok {
-        (pages.map(|p| format!("pages={p} not applied; whole PDF text returned")), None)
+        (
+            pages.map(|p| format!("pages={p} not applied; whole PDF text returned")),
+            None,
+        )
     } else {
         (
-            Some(format!("no text extracted from PDF ({size} bytes): pdftotext missing, or scanned/image-only PDF")),
-            Some("install poppler-utils (pdftotext) or use an HTML version of this document".to_string()),
+            Some(format!(
+                "no text extracted from PDF ({size} bytes): pdftotext missing, or scanned/image-only PDF"
+            )),
+            Some(
+                "install poppler-utils (pdftotext) or use an HTML version of this document"
+                    .to_string(),
+            ),
         )
     };
     ScrapeResult {
@@ -821,72 +904,100 @@ async fn pdf_out(
     (pdf, stats)
 }
 
-async fn fetch_chrome_with_actions(url: &str, actions: &[Action]) -> anyhow::Result<fetcher::Fetched> {
+async fn fetch_chrome_with_actions(
+    url: &str,
+    actions: &[Action],
+) -> anyhow::Result<fetcher::Fetched> {
     fetcher::check_public_url(url).await?;
     let url_owned = url.to_string();
     let acts = actions.to_owned();
-    let fetched = tokio::task::spawn_blocking(move || -> anyhow::Result<(String, fetcher::Fetched)> {
-        let browser = fetcher::get_browser()?;
-        let tab = {
-            let guard = browser.lock().map_err(|_| anyhow::anyhow!("browser lock"))?;
-            guard.new_tab()?
-        };
-        tab.set_default_timeout(Duration::from_secs(30));
-        tab.navigate_to(&url_owned)?;
-        tab.wait_until_navigated()?;
-        std::thread::sleep(Duration::from_millis(700));
-        for act in &acts {
-            match act {
-                Action::Click(sel) => {
-                    if let Ok(el) = tab.wait_for_element_with_custom_timeout(sel, Duration::from_secs(5)) {
-                        let _ = el.click();
+    let fetched =
+        tokio::task::spawn_blocking(move || -> anyhow::Result<(String, fetcher::Fetched)> {
+            let browser = fetcher::get_browser()?;
+            let tab = {
+                let guard = browser
+                    .lock()
+                    .map_err(|_| anyhow::anyhow!("browser lock"))?;
+                guard.new_tab()?
+            };
+            tab.set_default_timeout(Duration::from_secs(30));
+            tab.navigate_to(&url_owned)?;
+            tab.wait_until_navigated()?;
+            std::thread::sleep(Duration::from_millis(700));
+            for act in &acts {
+                match act {
+                    Action::Click(sel) => {
+                        if let Ok(el) =
+                            tab.wait_for_element_with_custom_timeout(sel, Duration::from_secs(5))
+                        {
+                            let _ = el.click();
+                        }
+                    }
+                    Action::Fill { selector, text } => {
+                        if let Ok(el) = tab
+                            .wait_for_element_with_custom_timeout(selector, Duration::from_secs(5))
+                        {
+                            let _ = el.click();
+                            let _ = el.type_into(text);
+                        }
+                    }
+                    Action::Press(key) => {
+                        let _ = tab.press_key(key);
+                    }
+                    Action::Wait(ms) => {
+                        std::thread::sleep(Duration::from_millis(*ms));
+                    }
+                    Action::Scroll(px) => {
+                        let expr = format!("window.scrollBy(0,{})", px);
+                        let _ = tab.evaluate(&expr, false);
+                        std::thread::sleep(Duration::from_millis(250));
                     }
                 }
-                Action::Fill { selector, text } => {
-                    if let Ok(el) = tab.wait_for_element_with_custom_timeout(selector, Duration::from_secs(5)) {
-                        let _ = el.click();
-                        let _ = el.type_into(text);
-                    }
-                }
-                Action::Press(key) => {
-                    let _ = tab.press_key(key);
-                }
-                Action::Wait(ms) => {
-                    std::thread::sleep(Duration::from_millis(*ms));
-                }
-                Action::Scroll(px) => {
-                    let expr = format!("window.scrollBy(0,{})", px);
-                    let _ = tab.evaluate(&expr, false);
-                    std::thread::sleep(Duration::from_millis(250));
-                }
+                std::thread::sleep(Duration::from_millis(300));
             }
-            std::thread::sleep(Duration::from_millis(300));
-        }
-        std::thread::sleep(Duration::from_millis(600));
-        let html = tab.get_content().unwrap_or_default();
-        let final_url = tab.get_url();
-        let reason = fetcher::block_reason(200, &html);
-        let _ = tab.close(true);
-        Ok((final_url, fetcher::Fetched {
-            html,
-            tier: fetcher::Tier::Chrome,
-            status: 200,
-            blocked: reason.is_some(),
-            reason: reason.clone(),
-            first_reason: None,
-            escalated: true,
-            first_status: 200,
-        }))
-    })
-    .await??;
+            std::thread::sleep(Duration::from_millis(600));
+            let html = tab.get_content().unwrap_or_default();
+            let final_url = tab.get_url();
+            let reason = fetcher::block_reason(200, &html);
+            let _ = tab.close(true);
+            Ok((
+                final_url,
+                fetcher::Fetched {
+                    html,
+                    tier: fetcher::Tier::Chrome,
+                    status: 200,
+                    blocked: reason.is_some(),
+                    reason: reason.clone(),
+                    first_reason: None,
+                    escalated: true,
+                    first_status: 200,
+                },
+            ))
+        })
+        .await??;
     let (final_url, fetched) = fetched;
     fetcher::check_public_url(&final_url).await?;
     Ok(fetched)
 }
 
 // Backwards-compatible entry point (used by batch/crawl/cli)
-async fn run(url: &str, focus: Option<&str>, max_chars: usize, include_links: bool) -> anyhow::Result<ScrapeResult> {
-    run_ext(url, focus, max_chars, include_links, None, false, None, None).await
+async fn run(
+    url: &str,
+    focus: Option<&str>,
+    max_chars: usize,
+    include_links: bool,
+) -> anyhow::Result<ScrapeResult> {
+    run_ext(
+        url,
+        focus,
+        max_chars,
+        include_links,
+        None,
+        false,
+        None,
+        None,
+    )
+    .await
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -900,9 +1011,18 @@ async fn run_ext(
     pages: Option<&str>,
     actions: Option<&[Action]>,
 ) -> anyhow::Result<ScrapeResult> {
-    Ok(run_ext_stats(url, focus, max_chars, include_links, offset, include_media, pages, actions)
-        .await?
-        .0)
+    Ok(run_ext_stats(
+        url,
+        focus,
+        max_chars,
+        include_links,
+        offset,
+        include_media,
+        pages,
+        actions,
+    )
+    .await?
+    .0)
 }
 
 // Same as `run_ext` but also returns timing/size stats for the `--stats` CLI flag.
@@ -961,7 +1081,11 @@ async fn run_ext_stats(
         return Ok(pdf_out(url, key, bytes, pages, focus, max_chars, offset, t0).await);
     }
     let status = got.status;
-    let bytes_down = if matches!(got.tier, fetcher::Tier::Http) { got.html.len() } else { 0 };
+    let bytes_down = if matches!(got.tier, fetcher::Tier::Http) {
+        got.html.len()
+    } else {
+        0
+    };
 
     let t_parse = std::time::Instant::now();
     let tier = format!("{:?}", got.tier).to_lowercase();
@@ -979,10 +1103,15 @@ async fn run_ext_stats(
     let html_len = got.html.len();
     let md_len = doc.markdown.trim().len();
     let text_len = doc.text.trim().len();
-    let thin = (md_len < 200 && html_len > 2000) || (text_len < 100 && html_len > 1500) || md_len == 0;
+    let thin =
+        (md_len < 200 && html_len > 2000) || (text_len < 100 && html_len > 1500) || md_len == 0;
     let stealth_wall = got.escalated && thin && got.first_reason.is_some();
     let (content_ok, note, next_action) = if got.blocked || stealth_wall {
-        let why = got.reason.clone().or_else(|| got.first_reason.clone()).unwrap_or_else(|| "blocked".into());
+        let why = got
+            .reason
+            .clone()
+            .or_else(|| got.first_reason.clone())
+            .unwrap_or_else(|| "blocked".into());
         (
             false,
             Some(format!("bot protection not bypassed (tier {tier}, {why}); no article recovered")),
@@ -994,24 +1123,30 @@ async fn run_ext_stats(
         } else {
             (
                 false,
-                Some(format!("no article extracted from {} bytes of HTML (app shell, index, or media page) - type: {}", html_len, doc.page_type)),
+                Some(format!(
+                    "no article extracted from {} bytes of HTML (app shell, index, or media page) - type: {}",
+                    html_len, doc.page_type
+                )),
                 Some("page has no prose to extract - try a specific article URL".to_string()),
             )
         }
     } else {
         (true, None, None)
     };
-    let (content_ok, note, next_action) = if !content_ok && doc.page_type == "list" && doc.links.len() > 10 && md_len > 50 {
-        (true, None, None)
-    } else {
-        (content_ok, note, next_action)
-    };
+    let (content_ok, note, next_action) =
+        if !content_ok && doc.page_type == "list" && doc.links.len() > 10 && md_len > 50 {
+            (true, None, None)
+        } else {
+            (content_ok, note, next_action)
+        };
 
     let total_chars = doc.markdown.chars().count();
     let (focused, focused_chars, missed) = focus_view(&doc.markdown, focus, content_ok);
     // Paragraphs removed by focus_filter: total minus what survived.
     let dropped_paras = if focus.is_some() && content_ok {
-        paragraphs(&doc.markdown).len().saturating_sub(paragraphs(&focused).len())
+        paragraphs(&doc.markdown)
+            .len()
+            .saturating_sub(paragraphs(&focused).len())
     } else {
         0
     };
@@ -1021,7 +1156,14 @@ async fn run_ext_stats(
     let truncated = next_offset.is_some();
 
     let links: Vec<LinkOut> = if include_links {
-        doc.links.into_iter().take(50).map(|l| LinkOut { href: l.href, text: l.text }).collect()
+        doc.links
+            .into_iter()
+            .take(50)
+            .map(|l| LinkOut {
+                href: l.href,
+                text: l.text,
+            })
+            .collect()
     } else {
         vec![]
     };
@@ -1063,7 +1205,16 @@ async fn run_ext_stats(
         }
     }
     let ms = t0.elapsed().as_millis();
-    let stats = Stats::scrape(&out, "miss", status, ms, ms_fetch, ms_parse, bytes_down, dropped_paras);
+    let stats = Stats::scrape(
+        &out,
+        "miss",
+        status,
+        ms,
+        ms_fetch,
+        ms_parse,
+        bytes_down,
+        dropped_paras,
+    );
     Ok((out, stats))
 }
 
@@ -1074,21 +1225,25 @@ async fn fetch_sitemap_urls(domain: &str) -> Vec<String> {
         let url = format!("https://{}/{}", domain, path);
         if let Ok(resp) = client.get(&url).send().await
             && resp.status().is_success()
-                && let Ok(text) = resp.text().await {
-                    let mut start = 0;
-                    while let Some(open) = text[start..].find("<loc>") {
-                        let open_idx = start + open + 5;
-                        if let Some(close) = text[open_idx..].find("</loc>") {
-                            let close_idx = open_idx + close;
-                            let loc = text[open_idx..close_idx].trim().to_string();
-                            if let Ok(u) = url::Url::parse(&loc)
-                                && u.host_str() == Some(domain) {
-                                    result.push(loc);
-                                }
-                            start = close_idx + 6;
-                        } else { break; }
+            && let Ok(text) = resp.text().await
+        {
+            let mut start = 0;
+            while let Some(open) = text[start..].find("<loc>") {
+                let open_idx = start + open + 5;
+                if let Some(close) = text[open_idx..].find("</loc>") {
+                    let close_idx = open_idx + close;
+                    let loc = text[open_idx..close_idx].trim().to_string();
+                    if let Ok(u) = url::Url::parse(&loc)
+                        && u.host_str() == Some(domain)
+                    {
+                        result.push(loc);
                     }
+                    start = close_idx + 6;
+                } else {
+                    break;
                 }
+            }
+        }
     }
     result.sort();
     result.dedup();
@@ -1096,15 +1251,33 @@ async fn fetch_sitemap_urls(domain: &str) -> Vec<String> {
 }
 
 #[allow(clippy::too_many_arguments)]
-async fn crawl_run(start_url: &str, max_pages: usize, max_depth: usize, focus: Option<&str>, max_chars: usize, sitemap: Option<bool>, discover_only: Option<bool>, max_total_chars: Option<usize>) -> anyhow::Result<CrawlResult> {
+async fn crawl_run(
+    start_url: &str,
+    max_pages: usize,
+    max_depth: usize,
+    focus: Option<&str>,
+    max_chars: usize,
+    sitemap: Option<bool>,
+    discover_only: Option<bool>,
+    max_total_chars: Option<usize>,
+) -> anyhow::Result<CrawlResult> {
     validate(start_url)?;
-    let start_domain = url::Url::parse(start_url)?.host_str().unwrap_or("").to_string();
+    let start_domain = url::Url::parse(start_url)?
+        .host_str()
+        .unwrap_or("")
+        .to_string();
     if sitemap.unwrap_or(false) {
         let sitemap_urls = fetch_sitemap_urls(&start_domain).await;
         if !sitemap_urls.is_empty() {
             if discover_only.unwrap_or(false) {
                 let visited: Vec<String> = sitemap_urls.into_iter().take(max_pages).collect();
-                return Ok(CrawlResult { start_url: start_url.to_string(), pages: vec![], visited, total_chars: 0, failed: vec![] });
+                return Ok(CrawlResult {
+                    start_url: start_url.to_string(),
+                    pages: vec![],
+                    visited,
+                    total_chars: 0,
+                    failed: vec![],
+                });
             }
             let mut pages: Vec<ScrapeResult> = Vec::new();
             let mut failed: Vec<(String, anyhow::Error)> = Vec::new();
@@ -1112,10 +1285,17 @@ async fn crawl_run(start_url: &str, max_pages: usize, max_depth: usize, focus: O
             let mut total_chars = 0usize;
             for url in sitemap_urls.into_iter().take(max_pages) {
                 if let Some(limit) = max_total_chars
-                    && total_chars >= limit { break; }
+                    && total_chars >= limit
+                {
+                    break;
+                }
                 let norm = normalize_url(&url);
-                if !visited.insert(norm) { continue; }
-                if pages.len() >= max_pages { break; }
+                if !visited.insert(norm) {
+                    continue;
+                }
+                if pages.len() >= max_pages {
+                    break;
+                }
                 let doc = match run(&url, focus, max_chars, true).await {
                     Ok(d) => d,
                     Err(e) => {
@@ -1126,10 +1306,18 @@ async fn crawl_run(start_url: &str, max_pages: usize, max_depth: usize, focus: O
                 total_chars += doc.markdown.chars().count();
                 let exceed = max_total_chars.map(|l| total_chars > l).unwrap_or(false);
                 pages.push(doc);
-                if exceed { break; }
+                if exceed {
+                    break;
+                }
             }
             let visited_list: Vec<String> = visited.into_iter().collect();
-            return Ok(CrawlResult { start_url: start_url.to_string(), pages, visited: visited_list, total_chars, failed });
+            return Ok(CrawlResult {
+                start_url: start_url.to_string(),
+                pages,
+                visited: visited_list,
+                total_chars,
+                failed,
+            });
         }
     }
     if discover_only.unwrap_or(false) {
@@ -1139,36 +1327,66 @@ async fn crawl_run(start_url: &str, max_pages: usize, max_depth: usize, focus: O
         visited.insert(normalize_url(start_url));
         let mut total_chars = 0usize;
         while let Some((url, depth)) = queue.pop_front() {
-            if visited.len() >= max_pages { break; }
-            if depth > max_depth { continue; }
+            if visited.len() >= max_pages {
+                break;
+            }
+            if depth > max_depth {
+                continue;
+            }
             if let Some(limit) = max_total_chars
-                && total_chars >= limit { break; }
+                && total_chars >= limit
+            {
+                break;
+            }
             let doc = match run(&url, focus, max_chars, true).await {
                 Ok(d) => d,
                 Err(_) => continue,
             };
             total_chars += doc.markdown.chars().count();
             if let Some(limit) = max_total_chars
-                && total_chars > limit { break; }
+                && total_chars > limit
+            {
+                break;
+            }
             if depth < max_depth && visited.len() < max_pages {
                 for link in &doc.links {
                     let href = &link.href;
-                    if visited.contains(&normalize_url(href)) { continue; }
+                    if visited.contains(&normalize_url(href)) {
+                        continue;
+                    }
                     if let Ok(u) = url::Url::parse(href) {
-                        if u.host_str() != Some(&start_domain) { continue; }
-                        if !matches!(u.scheme(), "http" | "https") { continue; }
-                        if href.ends_with(".pdf") || href.ends_with(".jpg") || href.ends_with(".png") || href.contains('#') { continue; }
+                        if u.host_str() != Some(&start_domain) {
+                            continue;
+                        }
+                        if !matches!(u.scheme(), "http" | "https") {
+                            continue;
+                        }
+                        if href.ends_with(".pdf")
+                            || href.ends_with(".jpg")
+                            || href.ends_with(".png")
+                            || href.contains('#')
+                        {
+                            continue;
+                        }
                         let norm = normalize_url(href);
                         if visited.insert(norm.clone()) {
                             queue.push_back((href.clone(), depth + 1));
-                            if visited.len() >= max_pages { break; }
+                            if visited.len() >= max_pages {
+                                break;
+                            }
                         }
                     }
                 }
             }
         }
         let visited_list: Vec<String> = visited.into_iter().collect();
-        return Ok(CrawlResult { start_url: start_url.to_string(), pages: vec![], visited: visited_list, total_chars: 0, failed: vec![] });
+        return Ok(CrawlResult {
+            start_url: start_url.to_string(),
+            pages: vec![],
+            visited: visited_list,
+            total_chars: 0,
+            failed: vec![],
+        });
     }
     // BFS one level at a time, 4 fetches in flight. `visited` lists only pages actually
     // fetched; `queued` stops a URL from being scheduled twice.
@@ -1187,7 +1405,15 @@ async fn crawl_run(start_url: &str, max_pages: usize, max_depth: usize, focus: O
             {
                 break 'bfs;
             }
-            for (url, res) in fetch_all(chunk.to_vec(), focus.map(str::to_string), max_chars, 4, "crawl_page").await {
+            for (url, res) in fetch_all(
+                chunk.to_vec(),
+                focus.map(str::to_string),
+                max_chars,
+                4,
+                "crawl_page",
+            )
+            .await
+            {
                 let doc = match res {
                     Ok((doc, _)) => doc,
                     Err(e) => {
@@ -1202,18 +1428,30 @@ async fn crawl_run(start_url: &str, max_pages: usize, max_depth: usize, focus: O
                     let mut candidates: Vec<(f32, String)> = Vec::new();
                     for link in &doc.links {
                         let href = &link.href;
-                        let Ok(u) = url::Url::parse(href) else { continue };
-                        if u.host_str() != Some(&start_domain) || !matches!(u.scheme(), "http" | "https") {
+                        let Ok(u) = url::Url::parse(href) else {
+                            continue;
+                        };
+                        if u.host_str() != Some(&start_domain)
+                            || !matches!(u.scheme(), "http" | "https")
+                        {
                             continue;
                         }
-                        if href.ends_with(".pdf") || href.ends_with(".jpg") || href.ends_with(".png") || href.contains('#') {
+                        if href.ends_with(".pdf")
+                            || href.ends_with(".jpg")
+                            || href.ends_with(".png")
+                            || href.contains('#')
+                        {
                             continue;
                         }
                         if queued.contains(&normalize_url(href)) {
                             continue;
                         }
                         let score = if let Some(q) = focus {
-                            let q_terms: Vec<String> = q.to_lowercase().split_whitespace().map(|s| s.to_string()).collect();
+                            let q_terms: Vec<String> = q
+                                .to_lowercase()
+                                .split_whitespace()
+                                .map(|s| s.to_string())
+                                .collect();
                             let lower = link.text.to_lowercase();
                             q_terms.iter().filter(|t| lower.contains(*t)).count() as f32
                         } else {
@@ -1237,18 +1475,27 @@ async fn crawl_run(start_url: &str, max_pages: usize, max_depth: usize, focus: O
         frontier = next;
         depth += 1;
     }
-    Ok(CrawlResult { start_url: start_url.to_string(), pages, visited, total_chars, failed })
+    Ok(CrawlResult {
+        start_url: start_url.to_string(),
+        pages,
+        visited,
+        total_chars,
+        failed,
+    })
 }
 
 fn normalize_url(u: &str) -> String {
     if let Ok(mut parsed) = url::Url::parse(u) {
         parsed.set_fragment(None);
         let mut s = parsed.to_string();
-        if s.ends_with('/') && s.len() > 8 { s.pop(); }
+        if s.ends_with('/') && s.len() > 8 {
+            s.pop();
+        }
         s
-    } else { u.to_string() }
+    } else {
+        u.to_string()
+    }
 }
-
 
 /// Raw PNG bytes of `url`, rendered by the headless browser.
 async fn screenshot_png(url: &str) -> anyhow::Result<Vec<u8>> {
@@ -1256,7 +1503,9 @@ async fn screenshot_png(url: &str) -> anyhow::Result<Vec<u8>> {
     fetcher::check_public_url(url).await?;
     let fetcher_browser = fetcher::get_browser()?;
     let tab = {
-        let guard = fetcher_browser.lock().map_err(|_| anyhow::anyhow!("browser lock"))?;
+        let guard = fetcher_browser
+            .lock()
+            .map_err(|_| anyhow::anyhow!("browser lock"))?;
         guard.new_tab()?
     };
     tab.set_default_timeout(std::time::Duration::from_secs(30));
@@ -1268,7 +1517,12 @@ async fn screenshot_png(url: &str) -> anyhow::Result<Vec<u8>> {
         let _ = tab.close(true);
         return Err(e);
     }
-    let png = tab.capture_screenshot(headless_chrome::protocol::cdp::Page::CaptureScreenshotFormatOption::Png, None, None, true)?;
+    let png = tab.capture_screenshot(
+        headless_chrome::protocol::cdp::Page::CaptureScreenshotFormatOption::Png,
+        None,
+        None,
+        true,
+    )?;
     let _ = tab.close(true);
     Ok(png)
 }
@@ -1278,7 +1532,11 @@ async fn screenshot_run(url: &str) -> anyhow::Result<String> {
     let png = screenshot_png(url).await?;
     use base64::{Engine as _, engine::general_purpose};
     let b64 = general_purpose::STANDARD.encode(&png);
-    Ok(if b64.len() > 20000 { format!("{}...[truncated {} bytes]", &b64[..20000], png.len()) } else { b64 })
+    Ok(if b64.len() > 20000 {
+        format!("{}...[truncated {} bytes]", &b64[..20000], png.len())
+    } else {
+        b64
+    })
 }
 
 // ── CLI ─────────────────────────────────────────────────────────────────────
@@ -1325,7 +1583,11 @@ const MAX_INPUTS: usize = 20;
 
 fn cap_inputs(mut items: Vec<String>, what: &str) -> Vec<String> {
     if items.len() > MAX_INPUTS {
-        eprintln!("warning: {what}: {} given, first {MAX_INPUTS} processed; dropped {}", items.len(), items.len() - MAX_INPUTS);
+        eprintln!(
+            "warning: {what}: {} given, first {MAX_INPUTS} processed; dropped {}",
+            items.len(),
+            items.len() - MAX_INPUTS
+        );
         items.truncate(MAX_INPUTS);
     }
     items
@@ -1343,25 +1605,65 @@ fn sh_single(s: &str) -> String {
 
 /// Markdown body plus, when truncated, a paste-able command for the rest. The command repeats
 /// the focus and max-chars that produced `next_offset`, so the offset lines up with the same text.
-fn with_hint(markdown: &str, url: &str, next_offset: Option<usize>, focused_chars: usize, focus: Option<&str>, max_chars: usize) -> String {
+fn with_hint(
+    markdown: &str,
+    url: &str,
+    next_offset: Option<usize>,
+    focused_chars: usize,
+    focus: Option<&str>,
+    max_chars: usize,
+) -> String {
     let Some(n) = next_offset else {
         return markdown.to_string();
     };
-    let mut cmd = format!("scour scrape {} --offset {n} --max-chars {max_chars}", sh_single(url));
+    let mut cmd = format!(
+        "scour scrape {} --offset {n} --max-chars {max_chars}",
+        sh_single(url)
+    );
     if let Some(f) = focus {
         cmd += &format!(" --focus {}", sh_single(f));
     }
     // focused_chars is 0 for results cached before the field existed.
-    let of = if focused_chars > 0 { format!(" of {focused_chars}") } else { String::new() };
+    let of = if focused_chars > 0 {
+        format!(" of {focused_chars}")
+    } else {
+        String::new()
+    };
     format!("{markdown}\n\n<!-- truncated at {n}{of} chars; more: {cmd} -->")
 }
 
 // Shared markdown emitter for the shim and the `scrape` subcommand.
 fn emit_scrape(r: &ScrapeResult, focus: Option<&str>, max_chars: usize) {
-    if let Some(n) = &r.note { eprintln!("warning: {n}"); }
-    if let Some(a) = &r.next_action { eprintln!("next: {a}"); }
-    eprintln!("page_type: {} quality: {:.2} links: {} headings: {} next_offset: {:?} media: {}", r.page_type, r.quality_score, r.links.len(), r.headings.len(), r.next_offset, r.media.len());
-    println!("# {}\n<!-- tier: {} content_ok: {} chars: {} -->\n\n{}", r.title, r.tier, r.content_ok, r.total_chars, with_hint(&r.markdown, &r.url, r.next_offset, r.focused_chars, focus, max_chars));
+    if let Some(n) = &r.note {
+        eprintln!("warning: {n}");
+    }
+    if let Some(a) = &r.next_action {
+        eprintln!("next: {a}");
+    }
+    eprintln!(
+        "page_type: {} quality: {:.2} links: {} headings: {} next_offset: {:?} media: {}",
+        r.page_type,
+        r.quality_score,
+        r.links.len(),
+        r.headings.len(),
+        r.next_offset,
+        r.media.len()
+    );
+    println!(
+        "# {}\n<!-- tier: {} content_ok: {} chars: {} -->\n\n{}",
+        r.title,
+        r.tier,
+        r.content_ok,
+        r.total_chars,
+        with_hint(
+            &r.markdown,
+            &r.url,
+            r.next_offset,
+            r.focused_chars,
+            focus,
+            max_chars
+        )
+    );
 }
 
 /// Placeholder result for a URL whose fetch failed (MCP batch).
@@ -1399,7 +1701,8 @@ fn flag_value<'a>(args: &'a [String], i: &mut usize) -> Result<&'a str, String> 
 }
 
 fn parse_num<T: std::str::FromStr>(s: &str, flag: &str) -> Result<T, String> {
-    s.parse().map_err(|_| format!("{flag} needs a number, got '{s}'"))
+    s.parse()
+        .map_err(|_| format!("{flag} needs a number, got '{s}'"))
 }
 
 /// Like `parse_num`, for counts that must be at least 1 (`--max-chars 0` would never advance).
@@ -1437,7 +1740,14 @@ struct ScrapeOpts {
 }
 
 fn parse_scrape(args: &[String]) -> Result<ScrapeOpts, String> {
-    let mut o = ScrapeOpts { url: String::new(), focus: None, max_chars: 6000, offset: None, json: false, stats: false };
+    let mut o = ScrapeOpts {
+        url: String::new(),
+        focus: None,
+        max_chars: 6000,
+        offset: None,
+        json: false,
+        stats: false,
+    };
     let mut words = Vec::new();
     let mut i = 0;
     while i < args.len() {
@@ -1478,7 +1788,14 @@ struct BatchOpts {
 }
 
 fn parse_batch(args: &[String]) -> Result<BatchOpts, String> {
-    let mut o = BatchOpts { urls: Vec::new(), focus: None, max_chars: 6000, parallel: 4, json: false, stats: false };
+    let mut o = BatchOpts {
+        urls: Vec::new(),
+        focus: None,
+        max_chars: 6000,
+        parallel: 4,
+        json: false,
+        stats: false,
+    };
     let mut i = 0;
     while i < args.len() {
         match args[i].as_str() {
@@ -1580,7 +1897,12 @@ fn parse_links(args: &[String]) -> Result<LinksOpts, String> {
         }
         i += 1;
     }
-    Ok(LinksOpts { url: one_url(words)?, filter, same_site, max })
+    Ok(LinksOpts {
+        url: one_url(words)?,
+        filter,
+        same_site,
+        max,
+    })
 }
 
 #[derive(Debug, PartialEq)]
@@ -1597,7 +1919,16 @@ struct CrawlOpts {
 
 fn parse_crawl(args: &[String]) -> Result<CrawlOpts, String> {
     let mut words = Vec::new();
-    let mut o = CrawlOpts { url: String::new(), max_pages: 10, depth: 2, focus: None, max_chars: 2500, sitemap: false, json: false, stats: false };
+    let mut o = CrawlOpts {
+        url: String::new(),
+        max_pages: 10,
+        depth: 2,
+        focus: None,
+        max_chars: 2500,
+        sitemap: false,
+        json: false,
+        stats: false,
+    };
     let mut i = 0;
     while i < args.len() {
         match args[i].as_str() {
@@ -1656,15 +1987,26 @@ fn page_links(html: &str, base_url: &str) -> Vec<extractor::Link> {
             }
             u.set_fragment(None);
             let abs = u.to_string();
-            seen.insert(abs.clone()).then(|| extractor::Link { href: abs, text: el.text().collect::<Vec<_>>().join(" ") })
+            seen.insert(abs.clone()).then(|| extractor::Link {
+                href: abs,
+                text: el.text().collect::<Vec<_>>().join(" "),
+            })
         })
         .collect()
 }
 
 /// `links`: dedupe by href, optional case-insensitive substring on href or
 /// text, optional same-host filter, capped at `max`. Returns (text, href).
-fn filter_links(links: &[extractor::Link], page_url: &str, filter: Option<&str>, same_site: bool, max: usize) -> Vec<(String, String)> {
-    let page_host = url::Url::parse(page_url).ok().and_then(|u| u.host_str().map(str::to_lowercase));
+fn filter_links(
+    links: &[extractor::Link],
+    page_url: &str,
+    filter: Option<&str>,
+    same_site: bool,
+    max: usize,
+) -> Vec<(String, String)> {
+    let page_host = url::Url::parse(page_url)
+        .ok()
+        .and_then(|u| u.host_str().map(str::to_lowercase));
     let needle = filter.map(str::to_lowercase);
     let mut seen: HashSet<String> = HashSet::new();
     let mut out = Vec::new();
@@ -1683,13 +2025,19 @@ fn filter_links(links: &[extractor::Link], page_url: &str, filter: Option<&str>,
             continue;
         }
         if same_site {
-            let host = url::Url::parse(&l.href).ok().and_then(|u| u.host_str().map(str::to_lowercase));
+            let host = url::Url::parse(&l.href)
+                .ok()
+                .and_then(|u| u.host_str().map(str::to_lowercase));
             if host.is_none() || host != page_host {
                 continue;
             }
         }
         seen.insert(l.href.clone());
-        let text: String = if text.is_empty() { "(no text)".to_string() } else { text.chars().take(100).collect() };
+        let text: String = if text.is_empty() {
+            "(no text)".to_string()
+        } else {
+            text.chars().take(100).collect()
+        };
         out.push((text, l.href.clone()));
     }
     out
@@ -1725,7 +2073,13 @@ type PageFetch = (String, anyhow::Result<(ScrapeResult, Stats)>);
 /// in input order: a failed or panicked task is an `Err` entry, never dropped.
 const PAGE_DEADLINE: Duration = Duration::from_secs(25);
 
-async fn fetch_all(urls: Vec<String>, focus: Option<String>, max_chars: usize, parallel: usize, op: &'static str) -> Vec<PageFetch> {
+async fn fetch_all(
+    urls: Vec<String>,
+    focus: Option<String>,
+    max_chars: usize,
+    parallel: usize,
+    op: &'static str,
+) -> Vec<PageFetch> {
     let sem = std::sync::Arc::new(tokio::sync::Semaphore::new(parallel.clamp(1, 8)));
     let handles: Vec<_> = urls
         .iter()
@@ -1736,10 +2090,24 @@ async fn fetch_all(urls: Vec<String>, focus: Option<String>, max_chars: usize, p
             tokio::spawn(async move {
                 let _permit = sem.acquire_owned().await;
                 // One dead host must not hold up the whole batch.
-                let fut = run_ext_stats(&url, focus.as_deref(), max_chars, true, None, false, None, None);
+                let fut = run_ext_stats(
+                    &url,
+                    focus.as_deref(),
+                    max_chars,
+                    true,
+                    None,
+                    false,
+                    None,
+                    None,
+                );
                 tokio::time::timeout(PAGE_DEADLINE, fut)
                     .await
-                    .unwrap_or_else(|_| Err(anyhow::anyhow!("timed out after {}s", PAGE_DEADLINE.as_secs())))
+                    .unwrap_or_else(|_| {
+                        Err(anyhow::anyhow!(
+                            "timed out after {}s",
+                            PAGE_DEADLINE.as_secs()
+                        ))
+                    })
                     .map(|(r, mut st)| {
                         st.op = op;
                         (r, st)
@@ -1749,7 +2117,9 @@ async fn fetch_all(urls: Vec<String>, focus: Option<String>, max_chars: usize, p
         .collect();
     let mut out = Vec::with_capacity(handles.len());
     for (url, handle) in urls.into_iter().zip(handles) {
-        let res = handle.await.unwrap_or_else(|e| Err(anyhow::anyhow!("fetch task failed: {e}")));
+        let res = handle
+            .await
+            .unwrap_or_else(|e| Err(anyhow::anyhow!("fetch task failed: {e}")));
         out.push((url, res));
     }
     out
@@ -1763,7 +2133,14 @@ fn fetched_md(r: &ScrapeResult, focus: Option<&str>, max_chars: usize) -> String
         r.tier,
         r.content_ok,
         r.total_chars,
-        with_hint(&r.markdown, &r.url, r.next_offset, r.focused_chars, focus, max_chars)
+        with_hint(
+            &r.markdown,
+            &r.url,
+            r.next_offset,
+            r.focused_chars,
+            focus,
+            max_chars
+        )
     )
 }
 
@@ -1809,7 +2186,18 @@ fn print_item_stats(pages: &[PageFetch]) {
 
 async fn cmd_scrape(args: &[String]) -> anyhow::Result<()> {
     let o = parse_scrape(args).unwrap_or_else(|e| usage(&e));
-    match run_ext_stats(&o.url, o.focus.as_deref(), o.max_chars, true, o.offset, false, None, None).await {
+    match run_ext_stats(
+        &o.url,
+        o.focus.as_deref(),
+        o.max_chars,
+        true,
+        o.offset,
+        false,
+        None,
+        None,
+    )
+    .await
+    {
         Ok((r, st)) => {
             if o.json {
                 println!("{}", serde_json::to_string(&r)?);
@@ -1833,7 +2221,14 @@ async fn cmd_scrape(args: &[String]) -> anyhow::Result<()> {
 async fn cmd_search(args: &[String]) -> anyhow::Result<()> {
     let o = parse_search(args).unwrap_or_else(|e| usage(&e));
     let t0 = std::time::Instant::now();
-    let (hits, engines, warning) = search_run(&o.query, o.max, o.site.as_deref(), None, o.freshness.as_deref()).await?;
+    let (hits, engines, warning) = search_run(
+        &o.query,
+        o.max,
+        o.site.as_deref(),
+        None,
+        o.freshness.as_deref(),
+    )
+    .await?;
     let ms = t0.elapsed().as_millis();
     let pages = if o.fetch > 0 {
         let urls: Vec<String> = hits.iter().take(o.fetch).map(|h| h.url.clone()).collect();
@@ -1841,7 +2236,13 @@ async fn cmd_search(args: &[String]) -> anyhow::Result<()> {
     } else {
         Vec::new()
     };
-    let sr = SearchResult { query: o.query.clone(), total: hits.len(), hits, engines, warning };
+    let sr = SearchResult {
+        query: o.query.clone(),
+        total: hits.len(),
+        hits,
+        engines,
+        warning,
+    };
     if o.json {
         let mut v = serde_json::to_value(&sr)?;
         if o.fetch > 0 {
@@ -1866,7 +2267,10 @@ async fn cmd_search(args: &[String]) -> anyhow::Result<()> {
     }
     if o.stats {
         print_item_stats(&pages);
-        eprintln!("stats: {}", serde_json::json!({"op":"search","query":&o.query,"hits":sr.total,"ms":ms,"engines":&sr.engines}));
+        eprintln!(
+            "stats: {}",
+            serde_json::json!({"op":"search","query":&o.query,"hits":sr.total,"ms":ms,"engines":&sr.engines})
+        );
     }
     if all_failed(&pages) {
         std::process::exit(1);
@@ -1888,7 +2292,14 @@ async fn cmd_batch(args: &[String]) -> anyhow::Result<()> {
     }
     let n = o.urls.len();
     let t0 = std::time::Instant::now();
-    let pages = fetch_all(o.urls, o.focus.clone(), o.max_chars, o.parallel, "batch_item").await;
+    let pages = fetch_all(
+        o.urls,
+        o.focus.clone(),
+        o.max_chars,
+        o.parallel,
+        "batch_item",
+    )
+    .await;
     if o.json {
         let arr: Vec<serde_json::Value> = pages.iter().map(|(u, r)| page_json(u, r)).collect();
         println!("{}", serde_json::Value::Array(arr));
@@ -1897,13 +2308,19 @@ async fn cmd_batch(args: &[String]) -> anyhow::Result<()> {
     }
     if o.stats {
         print_item_stats(&pages);
-        let ok = pages.iter().filter(|(_, r)| matches!(r, Ok((d, _)) if d.content_ok)).count();
+        let ok = pages
+            .iter()
+            .filter(|(_, r)| matches!(r, Ok((d, _)) if d.content_ok))
+            .count();
         let chars: usize = pages
             .iter()
             .filter_map(|(_, r)| r.as_ref().ok())
             .map(|(d, _)| d.markdown.chars().count())
             .sum();
-        eprintln!("stats: {}", serde_json::json!({"op":"batch","n":n,"ms":t0.elapsed().as_millis(),"chars_out":chars,"est_tokens":chars/4,"ok":ok}));
+        eprintln!(
+            "stats: {}",
+            serde_json::json!({"op":"batch","n":n,"ms":t0.elapsed().as_millis(),"chars_out":chars,"est_tokens":chars/4,"ok":ok})
+        );
     }
     if all_failed(&pages) {
         std::process::exit(1);
@@ -1920,10 +2337,11 @@ async fn cmd_gh(args: &[String]) -> anyhow::Result<()> {
     let o = &o;
     // At most 4 specs in flight: GitHub's unauthenticated quota is 60 requests/hour.
     use futures::StreamExt;
-    let res: Vec<anyhow::Result<String>> = futures::stream::iter(specs.iter().map(|s| gh_one(s, o)))
-        .buffered(4)
-        .collect()
-        .await;
+    let res: Vec<anyhow::Result<String>> =
+        futures::stream::iter(specs.iter().map(|s| gh_one(s, o)))
+            .buffered(4)
+            .collect()
+            .await;
     if print_lookups(&specs, res) > 0 {
         std::process::exit(1);
     }
@@ -1938,7 +2356,12 @@ async fn gh_one(spec: &str, o: &GhOpts) -> anyhow::Result<String> {
 
 /// Shared GitHub repo summary used by the CLI `gh` subcommand and the MCP `github_repo` tool.
 /// Returns the repo markdown plus, when `readme`, a focus-filtered, size-capped README excerpt.
-async fn gh_summary(spec: &str, readme: bool, focus: Option<&str>, max_chars: usize) -> anyhow::Result<String> {
+async fn gh_summary(
+    spec: &str,
+    readme: bool,
+    focus: Option<&str>,
+    max_chars: usize,
+) -> anyhow::Result<String> {
     let (repo, readme) = tools::gh_with_readme(spec, readme).await?;
     let Some(readme) = readme else {
         return Ok(repo);
@@ -1953,7 +2376,11 @@ async fn gh_summary(spec: &str, readme: bool, focus: Option<&str>, max_chars: us
                 None => (text, false),
             };
             let (body, next) = cut_page(&text, missed, 0, max_chars);
-            let marker = if next.is_some() { "\n\n<!-- readme truncated -->" } else { "" };
+            let marker = if next.is_some() {
+                "\n\n<!-- readme truncated -->"
+            } else {
+                ""
+            };
             format!("## README (excerpt)\n{}{marker}", body.trim_end())
         }
         Err(e) => format!("<!-- readme unavailable: {e} -->"),
@@ -1988,7 +2415,12 @@ fn parse_gh(args: &[String]) -> Result<GhOpts, String> {
     if !readme && (focus.is_some() || max_chars.is_some()) {
         return Err("--focus and --max-chars need --readme".into());
     }
-    Ok(GhOpts { specs, readme, focus, max_chars: max_chars.unwrap_or(1500) })
+    Ok(GhOpts {
+        specs,
+        readme,
+        focus,
+        max_chars: max_chars.unwrap_or(1500),
+    })
 }
 
 /// Registry names `tools::pkg` accepts (case-insensitive, surrounding spaces ignored).
@@ -2006,7 +2438,9 @@ async fn cmd_pkg(args: &[String]) -> anyhow::Result<()> {
     }
     let registry = words.remove(0);
     if !is_pkg_registry(&registry) {
-        usage(&format!("unknown registry '{registry}' (valid: crates, npm, pypi)"));
+        usage(&format!(
+            "unknown registry '{registry}' (valid: crates, npm, pypi)"
+        ));
     }
     let names = cap_inputs(words, "pkg");
     let res = futures::future::join_all(names.iter().map(|n| tools::pkg(&registry, n))).await;
@@ -2021,9 +2455,18 @@ async fn cmd_links(args: &[String]) -> anyhow::Result<()> {
     validate(&o.url)?;
     let got = fetcher::fetch(&o.url).await?;
     if got.blocked {
-        eprintln!("warning: content_ok false ({}); links may come from a block page", got.reason.as_deref().unwrap_or("blocked"));
+        eprintln!(
+            "warning: content_ok false ({}); links may come from a block page",
+            got.reason.as_deref().unwrap_or("blocked")
+        );
     }
-    for (text, href) in filter_links(&page_links(&got.html, &o.url), &o.url, o.filter.as_deref(), o.same_site, o.max) {
+    for (text, href) in filter_links(
+        &page_links(&got.html, &o.url),
+        &o.url,
+        o.filter.as_deref(),
+        o.same_site,
+        o.max,
+    ) {
         println!("{text} — {href}");
     }
     Ok(())
@@ -2032,7 +2475,17 @@ async fn cmd_links(args: &[String]) -> anyhow::Result<()> {
 async fn cmd_crawl(args: &[String]) -> anyhow::Result<()> {
     let o = parse_crawl(args).unwrap_or_else(|e| usage(&e));
     let t0 = std::time::Instant::now();
-    let res = crawl_run(&o.url, o.max_pages, o.depth, o.focus.as_deref(), o.max_chars, Some(o.sitemap), None, None).await?;
+    let res = crawl_run(
+        &o.url,
+        o.max_pages,
+        o.depth,
+        o.focus.as_deref(),
+        o.max_chars,
+        Some(o.sitemap),
+        None,
+        None,
+    )
+    .await?;
     if o.json {
         let mut v = serde_json::to_value(&res)?;
         if let Some(items) = v["pages"].as_array_mut() {
@@ -2048,7 +2501,10 @@ async fn cmd_crawl(args: &[String]) -> anyhow::Result<()> {
         }
     }
     if o.stats {
-        eprintln!("stats: {}", serde_json::json!({"op":"crawl","start_url":&o.url,"pages":res.pages.len(),"visited":res.visited.len(),"total_chars":res.total_chars,"ms":t0.elapsed().as_millis()}));
+        eprintln!(
+            "stats: {}",
+            serde_json::json!({"op":"crawl","start_url":&o.url,"pages":res.pages.len(),"visited":res.visited.len(),"total_chars":res.total_chars,"ms":t0.elapsed().as_millis()})
+        );
     }
     Ok(())
 }
@@ -2057,7 +2513,10 @@ async fn cmd_screenshot(args: &[String]) -> anyhow::Result<()> {
     let (url, out) = parse_screenshot(args).unwrap_or_else(|e| usage(&e));
     let png = screenshot_png(&url).await?;
     let path = out.unwrap_or_else(|| {
-        let ts = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
+        let ts = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
         format!("/tmp/scour-{ts}.png")
     });
     std::fs::write(&path, &png)?;
@@ -2090,7 +2549,10 @@ async fn main() -> anyhow::Result<()> {
     match cmd {
         None => {}
         Some("--version" | "-V") => {
-            println!("{}", serde_json::to_string(&version_info()).unwrap_or_default());
+            println!(
+                "{}",
+                serde_json::to_string(&version_info()).unwrap_or_default()
+            );
             return Ok(());
         }
         Some("scrape") => finish(cmd_scrape(&args[1..]).await),
@@ -2152,10 +2614,23 @@ mod cli_tests {
         let o = parse_gh(&s(&["tokio-rs/axum", "actix/actix-web"])).unwrap();
         assert_eq!((o.specs.len(), o.readme, o.max_chars), (2, false, 1500));
         assert_eq!(o.focus, None);
-        let o = parse_gh(&s(&["tokio-rs/axum", "--readme", "--focus", "middleware tower", "--max-chars", "600"])).unwrap();
+        let o = parse_gh(&s(&[
+            "tokio-rs/axum",
+            "--readme",
+            "--focus",
+            "middleware tower",
+            "--max-chars",
+            "600",
+        ]))
+        .unwrap();
         assert_eq!(
             o,
-            GhOpts { specs: s(&["tokio-rs/axum"]), readme: true, focus: Some("middleware tower".into()), max_chars: 600 }
+            GhOpts {
+                specs: s(&["tokio-rs/axum"]),
+                readme: true,
+                focus: Some("middleware tower".into()),
+                max_chars: 600
+            }
         );
         assert!(parse_gh(&s(&["x/y", "--focus", "q"])).is_err());
         assert!(parse_gh(&s(&["x/y", "--max-chars", "300"])).is_err());
@@ -2166,19 +2641,37 @@ mod cli_tests {
 
     #[test]
     fn links_filter_dedupes_and_scopes() {
-        let l = |href: &str, text: &str| extractor::Link { href: href.into(), text: text.into() };
+        let l = |href: &str, text: &str| extractor::Link {
+            href: href.into(),
+            text: text.into(),
+        };
         let links = vec![
-            l("https://docs.rs/axum/latest/axum/middleware/index.html", "Middleware"),
-            l("https://docs.rs/axum/latest/axum/middleware/index.html", "Middleware"),
+            l(
+                "https://docs.rs/axum/latest/axum/middleware/index.html",
+                "Middleware",
+            ),
+            l(
+                "https://docs.rs/axum/latest/axum/middleware/index.html",
+                "Middleware",
+            ),
             l("https://github.com/tokio-rs/axum", "GitHub"),
-            l("https://docs.rs/axum/latest/axum/routing/", "  Routing\n  Guide "),
+            l(
+                "https://docs.rs/axum/latest/axum/routing/",
+                "  Routing\n  Guide ",
+            ),
         ];
         let page = "https://docs.rs/axum/latest/axum/";
         let all = filter_links(&links, page, None, false, 100);
         assert_eq!(all.len(), 3);
         assert_eq!(all[2].0, "Routing Guide");
-        assert_eq!(filter_links(&links, page, Some("MIDDLEWARE"), false, 100).len(), 1);
-        assert_eq!(filter_links(&links, page, Some("github"), false, 100).len(), 1);
+        assert_eq!(
+            filter_links(&links, page, Some("MIDDLEWARE"), false, 100).len(),
+            1
+        );
+        assert_eq!(
+            filter_links(&links, page, Some("github"), false, 100).len(),
+            1
+        );
         let same = filter_links(&links, page, None, true, 100);
         assert_eq!(same.len(), 2);
         assert!(same.iter().all(|(_, h)| h.starts_with("https://docs.rs")));
@@ -2188,15 +2681,28 @@ mod cli_tests {
     #[test]
     fn page_links_resolves_strips_fragments_and_dedupes() {
         let html = r##"<a href="/x">X</a><a href="/x#a">again</a><a href="#top">top</a><a href="javascript:void(0)">j</a><a href="mailto:a@b.c">m</a><a href="https://o.com/y#z"></a>"##;
-        let hrefs: Vec<String> = page_links(html, "https://e.com/a/").into_iter().map(|l| l.href).collect();
+        let hrefs: Vec<String> = page_links(html, "https://e.com/a/")
+            .into_iter()
+            .map(|l| l.href)
+            .collect();
         assert_eq!(hrefs, vec!["https://e.com/x", "https://o.com/y"]);
     }
 
     #[test]
     fn truncation_hint_is_pasteable() {
-        assert_eq!(with_hint("abc", "https://e.com/a", None, 0, None, 300), "abc");
         assert_eq!(
-            with_hint("abc", "https://e.com/a", Some(150), 900, Some("rust traits"), 300),
+            with_hint("abc", "https://e.com/a", None, 0, None, 300),
+            "abc"
+        );
+        assert_eq!(
+            with_hint(
+                "abc",
+                "https://e.com/a",
+                Some(150),
+                900,
+                Some("rust traits"),
+                300
+            ),
             "abc\n\n<!-- truncated at 150 of 900 chars; more: scour scrape 'https://e.com/a' --offset 150 --max-chars 300 --focus 'rust traits' -->"
         );
         assert_eq!(
@@ -2204,7 +2710,9 @@ mod cli_tests {
             "x\n\n<!-- truncated at 5 of 9 chars; more: scour scrape 'https://e.com/it'\\''s' --offset 5 --max-chars 6000 -->"
         );
         assert_eq!(sh_single("a \"b\" $c `d` !e"), "'a \"b\" $c `d` !e'");
-        assert!(with_hint("x", "https://e.com", Some(1), 2, Some("hi!"), 9).contains("--focus 'hi!'"));
+        assert!(
+            with_hint("x", "https://e.com", Some(1), 2, Some("hi!"), 9).contains("--focus 'hi!'")
+        );
     }
 
     #[test]
@@ -2218,7 +2726,12 @@ mod cli_tests {
     #[test]
     fn links_and_pkg_usage_errors() {
         assert!(parse_links(&s(&["https://e.com", "--max", "0"])).is_err());
-        assert_eq!(parse_links(&s(&["https://e.com", "--max", "3"])).unwrap().max, 3);
+        assert_eq!(
+            parse_links(&s(&["https://e.com", "--max", "3"]))
+                .unwrap()
+                .max,
+            3
+        );
         assert!(is_pkg_registry("NPM") && is_pkg_registry(" pip ") && is_pkg_registry("crates.io"));
         assert!(!is_pkg_registry("maven"));
     }
@@ -2248,7 +2761,12 @@ mod cli_tests {
         assert!(parse_batch(&s(&["https://e.com", "--max-chars", "0"])).is_err());
         assert!(parse_search(&s(&["x", "--max-chars", "0"])).is_err());
         assert!(parse_crawl(&s(&["https://e.com", "--max-chars", "0"])).is_err());
-        assert_eq!(parse_scrape(&s(&["https://e.com", "--max-chars", "1"])).unwrap().max_chars, 1);
+        assert_eq!(
+            parse_scrape(&s(&["https://e.com", "--max-chars", "1"]))
+                .unwrap()
+                .max_chars,
+            1
+        );
     }
 
     #[test]
@@ -2267,7 +2785,15 @@ mod cli_tests {
 
     #[test]
     fn scrape_parses_offset_focus_and_rejects_unknown() {
-        let o = parse_scrape(&s(&["https://e.com", "rust", "traits", "--offset", "6000", "--json"])).unwrap();
+        let o = parse_scrape(&s(&[
+            "https://e.com",
+            "rust",
+            "traits",
+            "--offset",
+            "6000",
+            "--json",
+        ]))
+        .unwrap();
         assert_eq!(o.url, "https://e.com");
         assert_eq!(o.focus.as_deref(), Some("rust traits"));
         assert_eq!((o.offset, o.max_chars, o.json), (Some(6000), 6000, true));
@@ -2283,7 +2809,12 @@ mod cli_tests {
 
     #[test]
     fn crawl_caps_max_pages() {
-        assert_eq!(parse_crawl(&s(&["https://e.com", "--max-pages", "999"])).unwrap().max_pages, 50);
+        assert_eq!(
+            parse_crawl(&s(&["https://e.com", "--max-pages", "999"]))
+                .unwrap()
+                .max_pages,
+            50
+        );
         assert_eq!(parse_crawl(&s(&["https://e.com"])).unwrap().max_pages, 10);
     }
 }
@@ -2340,7 +2871,10 @@ mod tests {
         assert!(missed && !text.contains(super::FOCUS_MISS));
         assert_eq!(n, md.chars().count());
         // Focus is ignored for unusable content.
-        assert_eq!(super::focus_view(md, Some("cats"), false), (md.to_string(), md.chars().count(), false));
+        assert_eq!(
+            super::focus_view(md, Some("cats"), false),
+            (md.to_string(), md.chars().count(), false)
+        );
     }
 
     #[test]
@@ -2348,12 +2882,21 @@ mod tests {
         let md = "```rust\nlet a = 1;\n\nlet b = 2;\nlet c = 3;\n```";
         // The cut lands inside the fence at the blank line after `let a = 1;`.
         let (out, next) = super::cut_page(md, true, 0, 25);
-        assert_eq!(out, format!("```rust\nlet a = 1;\n```\n\n{}", super::FOCUS_MISS));
+        assert_eq!(
+            out,
+            format!("```rust\nlet a = 1;\n```\n\n{}", super::FOCUS_MISS)
+        );
         assert_eq!(next, Some(18));
         assert_eq!(out.matches("```").count() % 2, 0);
         // No cut: text untouched, note still appended, no offset.
-        assert_eq!(super::cut_page("abc", true, 0, 100), (format!("abc\n\n{}", super::FOCUS_MISS), None));
-        assert_eq!(super::cut_page("abc", false, 0, 100), ("abc".to_string(), None));
+        assert_eq!(
+            super::cut_page("abc", true, 0, 100),
+            (format!("abc\n\n{}", super::FOCUS_MISS), None)
+        );
+        assert_eq!(
+            super::cut_page("abc", false, 0, 100),
+            ("abc".to_string(), None)
+        );
     }
 
     #[test]
@@ -2384,8 +2927,14 @@ mod tests {
 
     #[test]
     fn normalize_strips_fragment() {
-        assert_eq!(super::normalize_url("https://example.com/a#frag"), "https://example.com/a");
-        assert_eq!(super::normalize_url("https://example.com/b/"), "https://example.com/b");
+        assert_eq!(
+            super::normalize_url("https://example.com/a#frag"),
+            "https://example.com/a"
+        );
+        assert_eq!(
+            super::normalize_url("https://example.com/b/"),
+            "https://example.com/b"
+        );
     }
 
     #[test]
@@ -2404,7 +2953,11 @@ mod tests {
         let offset = 100;
         let sliced = super::slice_at_offset(&md, offset);
         let (out, truncated) = super::truncate(&sliced, 50);
-        let next = if truncated { Some(offset + out.len()) } else { None };
+        let next = if truncated {
+            Some(offset + out.len())
+        } else {
+            None
+        };
         assert_eq!(next, Some(150));
     }
 
@@ -2432,9 +2985,18 @@ mod tests {
     fn action_deser_click_and_fill() {
         let j1 = r##"{"click":"#button"}"##;
         let a1: super::Action = serde_json::from_str(j1).unwrap();
-        match a1 { super::Action::Click(s) => assert_eq!(s, "#button"), _ => panic!("wrong") }
+        match a1 {
+            super::Action::Click(s) => assert_eq!(s, "#button"),
+            _ => panic!("wrong"),
+        }
         let j2 = r##"{"fill":{"selector":"#input","text":"hello"}}"##;
         let a2: super::Action = serde_json::from_str(j2).unwrap();
-        match a2 { super::Action::Fill { selector, text } => { assert_eq!(selector, "#input"); assert_eq!(text, "hello"); }, _ => panic!("wrong") }
+        match a2 {
+            super::Action::Fill { selector, text } => {
+                assert_eq!(selector, "#input");
+                assert_eq!(text, "hello");
+            }
+            _ => panic!("wrong"),
+        }
     }
 }
