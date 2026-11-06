@@ -39,9 +39,11 @@ Quality is scored automatically against live crates.io and GitHub APIs, URL live
 - Numbers vary run to run and depend on search-engine availability. This is one task on one model, not a general benchmark.
 - Reproduce it with `bench/` (see [bench/README.md](bench/README.md)).
 
+Quality checks compare against live crates.io/GitHub data at scoring time, so re-scoring old runs after a new release lowers their score.
+
 ## Install
 
-Prebuilt binaries for Linux and macOS (x86_64 and aarch64) are on the [Releases page](https://github.com/AdamUnderwood375/scour/releases). Or download from the command line:
+Prebuilt binaries for Linux and macOS (x86_64 and aarch64) are on the [Releases page](https://github.com/AdamUnderwood375/scour/releases). Linux binaries need glibc >= 2.35 (Ubuntu 22.04+, Debian 12+). Or download from the command line:
 
 ```sh
 gh release download --repo AdamUnderwood375/scour --pattern '*x86_64-unknown-linux-gnu.tar.gz'
@@ -51,7 +53,8 @@ tar xzf scour-*-x86_64-unknown-linux-gnu.tar.gz scour && install -m 755 scour ~/
 With Rust installed, install from git. The crates.io name `scour` belongs to another project:
 
 ```sh
-cargo install --git https://github.com/AdamUnderwood375/scour
+cargo install --git https://github.com/AdamUnderwood375/scour --tag v0.2.0
+# unpinned (latest main): cargo install --git https://github.com/AdamUnderwood375/scour
 ```
 
 To build from source:
@@ -187,7 +190,7 @@ flowchart TD
     E -- "SSRF refusal or timeout" --> Err["Return error, no browser"]
     E -- yes --> F["Public-URL pre-check"]
     F --> G["Tier 2: headless Chromium<br/>public-URL check after redirects"]
-    G --> X["Extract: readability,<br/>list/link fallback if thin"]
+    G --> X["Extract: main-content root<br/>(readability only as fallback),<br/>strip page furniture"]
     X --> M["Clean markdown<br/>fence-aware junk removal"]
     M --> I{"Focus given?"}
     I -- yes --> J["IDF-weighted paragraph ranking<br/>heading boost; fence-aware"]
@@ -224,7 +227,7 @@ Notes:
 
 ### Extraction and focus
 
-- **Extraction:** readability first. If readability returns thin output from a page with substantial visible text (list and index pages such as Hacker News), a link-aware list fallback runs instead.
+- **Extraction:** the main content is the best-scoring of `article`, `main`/`[role=main]`, MediaWiki content, and common content containers with ≥200 chars of text; readability runs only if none qualify, `<body>` is last. Page furniture (by tag, ARIA role, and small class/id-tagged widgets such as nav, cookie and share bars) is stripped before conversion; `<pre>` blocks become fenced code verbatim; Wikipedia infoboxes follow the lead paragraph. Link-dominated pages (Hacker News, index pages) are classified `list`.
 - **Focus:** the query is tokenised and paragraphs are scored with IDF-weighted term frequency. Headings get a boost. Fenced code blocks are never split. Results come back in page order. If nothing matches, the unfocused page is returned with a `<!-- focus matched nothing … -->` note.
 - **Truncation** prefers a paragraph boundary and always cuts on a character boundary, so multi-byte text is never split.
 
@@ -275,6 +278,7 @@ Source layout:
 | `src/search.rs` | Engine queries, pacing and cooldowns, parsers, rank fusion |
 | `src/tools.rs` | `gh` and `pkg` lookups (GitHub, crates.io, npm, PyPI) |
 | `src/cache.rs` | 1-hour LRU and file cache |
+| `src/types.rs` | Shared request and result types |
 
 Agent skill: `skills/scour/SKILL.md`.
 

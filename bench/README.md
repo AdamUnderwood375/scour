@@ -34,6 +34,7 @@ row for 2+ arms).
 
 - `pi` CLI on PATH + a model provider key (default model
   `anthropic/claude-haiku-5-5`, override with `SCOUR_BENCH_MODEL`).
+- Linux (`run.sh` uses GNU `date` and `timeout`).
 - A release `scour` build (`cargo build --release`).
 - For the `mcp` arm: a pi MCP extension via `SCOUR_MCP_EXT`.
 

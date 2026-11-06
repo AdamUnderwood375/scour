@@ -44,15 +44,24 @@ def main():
         n = len(rows)
         mean = ['mean']
         for i in range(1, len(cols)):
-            mean.append(round(sum(r[i] for r in rows) / n, 1))
+            mean.append(sum(r[i] for r in rows) / n)
         rows.append(mean)
-    widths = [max(len(str(c)), max((len(str(r[i])) for r in rows), default=0))
+
+    def cell(col, v):
+        if col == 'cost_usd':
+            return f'{float(v):.4f}'
+        if isinstance(v, float):
+            return f'{v:.1f}'
+        return str(v)
+
+    table = [[cell(c, v) for c, v in zip(cols, r)] for r in rows]
+    widths = [max(len(c), max((len(t[i]) for t in table), default=0))
               for i, c in enumerate(cols)]
     def fmt(vals):
-        return '  '.join(str(v).rjust(widths[i]) for i, v in enumerate(vals))
+        return '  '.join(v.rjust(widths[i]) for i, v in enumerate(vals))
     print(fmt(cols))
-    for r in rows:
-        print(fmt(r))
+    for t in table:
+        print(fmt(t))
 
 if __name__ == '__main__':
     main()

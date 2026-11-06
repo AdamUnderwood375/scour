@@ -52,8 +52,7 @@ $S search "axum vs actix web comparison 2025" --max 8 --fetch 3 --max-chars 2500
 
 ## Notes
 
-- Tiers: HTTP with a Chrome UA first. It escalates to headless Chromium on a block (401/403/429/503, tiny body, Cloudflare). Set `SCOUR_BROWSER=/path` to choose the browser.
+- Tiers: HTTP with a Chrome UA first. It escalates to headless Chromium on a block (401/403/407/429/503, tiny body, Cloudflare). Set `SCOUR_BROWSER=/path` to choose the browser.
 - Private/loopback/metadata addresses are blocked, including via DNS or redirects. scour cannot fetch localhost.
 - PDFs (by URL or by `%PDF` content) are converted to text via `pdftotext`. Cache: 1h at `~/.cache/scour/cache.json`. Use `$S cache-clear` for freshness-sensitive runs.
 - `gh` uses `$GITHUB_TOKEN` if set (unauthenticated: 60 req/h; `--readme` costs 1 extra request per repo).
-- Keep `~/.pi/agent/extensions/scour.ts.off` off. The MCP form costs ~1.2k schema tokens and 40k-char results that get re-sent every turn.

@@ -37,6 +37,12 @@ fi
 
 B=$OUT/$LABEL
 
+# Refuse to reuse an arm dir: its pi session id would resume the old session.
+if [ -e "$B/$ARM" ]; then
+  echo "error: $B/$ARM already exists; choose a new label" >&2
+  exit 1
+fi
+
 clear_cache() {
   rm -f "$HOME/.cache/scour/cache.json"
 }

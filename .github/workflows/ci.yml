@@ -18,7 +18,7 @@ jobs:
       - name: cargo fmt
         run: cargo fmt --all -- --check
       - name: clippy (-D warnings)
-        run: cargo clippy --all-targets -- -D warnings
+        run: cargo clippy --locked --all-targets -- -D warnings
 
   test:
     strategy:
@@ -31,9 +31,9 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - name: cargo test
-        run: cargo test
+        run: cargo test --locked
       - name: build release
-        run: cargo build --release
+        run: cargo build --release --locked
 
   msrv:
     runs-on: ubuntu-latest
@@ -42,4 +42,4 @@ jobs:
       - uses: dtolnay/rust-toolchain@1.89
       - uses: Swatinem/rust-cache@v2
       - name: cargo check (MSRV 1.89)
-        run: cargo check
+        run: cargo check --locked
