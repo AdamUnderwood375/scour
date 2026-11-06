@@ -110,9 +110,18 @@ pub async fn pkg(registry: &str, name: &str) -> Result<String> {
             Ok(format_crate(&v))
         }
         "npm" | "npmjs" => {
-            let url = format!("https://registry.npmjs.org/{enc_name}");
-            let v = fetch_json("npm", &url, &[]).await?;
-            Ok(format_npm(&v))
+            // The full packument can be tens of MB (react > 2 MB); `/latest` is
+            // the small manifest. The publish date comes from the search API,
+            // best-effort, only when its top hit is this exact package.
+            let latest = format!("https://registry.npmjs.org/{enc_name}/latest");
+            let search = format!("https://registry.npmjs.org/-/v1/search?text={enc_name}&size=1");
+            let (v, found) = tokio::join!(fetch_json("npm", &latest, &[]), fetch_json("npm", &search, &[]));
+            let v = v?;
+            let date = found.ok().and_then(|f| {
+                let p = &f["objects"][0]["package"];
+                (p["name"] == v["name"] && p["version"] == v["version"]).then(|| p["date"].as_str().map(String::from))?
+            });
+            Ok(format_npm(&v, date.as_deref()))
         }
         "pypi" | "pip" => {
             let url = format!("https://pypi.org/pypi/{enc_name}/json");
@@ -531,15 +540,13 @@ pub fn format_crate(v: &Value) -> String {
     out.join("\n")
 }
 
-pub fn format_npm(v: &Value) -> String {
-    let ver = s(&v["dist-tags"], "latest").unwrap_or("?");
+/// `v` is the `/latest` manifest; `published` is an ISO timestamp if known.
+pub fn format_npm(v: &Value, published: Option<&str>) -> String {
+    let ver = s(v, "version").unwrap_or("?");
     let license = s(v, "license").or(s(&v["license"], "type")).unwrap_or("?");
     let mut out = vec![format!("# {} {ver}", s(v, "name").unwrap_or("?"))];
     out.extend(s(v, "description").map(String::from));
-    out.push(format!(
-        "Published: {} · License: {license}",
-        s(&v["time"], ver).map_or("?", date)
-    ));
+    out.push(format!("Published: {} · License: {license}", published.map_or("?", date)));
     out.extend(s(v, "name").map(|n| format!("Registry: https://www.npmjs.com/package/{n}")));
     let repo = s(v, "repository").or(s(&v["repository"], "url"));
     if let Some(r) = repo {
@@ -739,14 +746,13 @@ mod tests {
     fn formats_npm() {
         let v = json!({
             "name": "react", "description": "React is a JavaScript library",
-            "dist-tags": {"latest": "19.1.0"},
-            "time": {"19.1.0": "2025-03-28T15:00:00.000Z"},
+            "version": "19.1.0",
             "license": "MIT",
             "repository": {"type": "git", "url": "git+https://github.com/facebook/react.git"},
             "homepage": "https://react.dev/"
         });
         assert_eq!(
-            format_npm(&v),
+            format_npm(&v, Some("2025-03-28T15:00:00.000Z")),
             "# react 19.1.0\nReact is a JavaScript library\n\
              Published: 2025-03-28 · License: MIT\n\
              Registry: https://www.npmjs.com/package/react\n\
