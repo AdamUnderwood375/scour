@@ -365,7 +365,7 @@ pub(crate) fn version_info() -> serde_json::Value {
         "name": "scour",
         "version": env!("CARGO_PKG_VERSION"),
         "tools": ["scrape", "scrape_batch", "crawl", "search", "github_repo", "package_info", "screenshot", "cache_clear", "scour_version"],
-        "features": ["http+chrome ladder", "readability+fallback", "bm25 focus", "parallel batch", "in-domain crawl", "5-engine fused search", "search --fetch", "github/registry shortcuts", "ssrf guard", "fence-aware markdown cleanup", "links+page_type", "1hr cache", "keyless search", "screenshot", "offset pagination", "include_media", "actions", "pdf pages"],
+        "features": ["http+chrome ladder", "main-content extraction", "idf focus filter", "parallel batch", "in-domain crawl", "5-engine fused search", "search --fetch", "github/registry shortcuts", "ssrf guard", "fence-aware markdown cleanup", "links+page_type", "1hr cache", "keyless search", "screenshot", "offset pagination", "include_media", "actions", "pdf pages"],
         "browser": fetcher::browser_path().map(|p| p.display().to_string()).unwrap_or_else(|_| "none found".to_string())
     })
 }

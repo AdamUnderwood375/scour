@@ -199,9 +199,9 @@ fn extract_meta(doc: &Html) -> (Option<String>, Option<String>) {
     (title, desc)
 }
 
-/// True when the element is page furniture by tag, role, hidden flag, or class/id words.
-fn is_skipped(e: &Element, name: &str, content_depth: u32) -> bool {
-    if SKIP_TAGS.contains(&name) || (name == "header" && content_depth == 0) {
+/// True when the element is page furniture by tag, role, hidden flag, or citation marker.
+fn is_skipped(e: &Element, name: &str) -> bool {
+    if SKIP_TAGS.contains(&name) {
         return true;
     }
     if e.attr("hidden").is_some() || e.attr("aria-hidden") == Some("true") {
@@ -211,13 +211,11 @@ fn is_skipped(e: &Element, name: &str, content_depth: u32) -> bool {
         return true;
     }
     // Wikipedia citation markers ([85]); `a.reference` links elsewhere are real text.
-    if name == "sup" && e.classes().any(|c| c == "reference") {
-        return true;
-    }
-    // Code keeps its class-based markup (e.g. highlighter spans) and is never stripped.
-    if matches!(name, "pre" | "code") {
-        return false;
-    }
+    name == "sup" && e.classes().any(|c| c == "reference")
+}
+
+/// True when a class/id token marks page furniture (whole `-`-separated word match).
+fn is_class_noise(e: &Element) -> bool {
     let hit = |v: Option<&str>| {
         v.is_some_and(|v| {
             v.split_whitespace().any(|tok| {
@@ -229,6 +227,17 @@ fn is_skipped(e: &Element, name: &str, content_depth: u32) -> bool {
     hit(e.attr("class")) || hit(e.attr("id"))
 }
 
+/// Visible (trimmed) text length of the whole subtree. Iterative, so deep trees are safe.
+fn subtree_text_len(el: ElementRef) -> usize {
+    el.text().map(|t| t.trim().len()).sum()
+}
+
+/// A `<header>` holding a section heading is article content, not site chrome.
+fn has_heading(el: ElementRef) -> bool {
+    el.descendent_elements()
+        .any(|d| matches!(d.value().name(), "h1" | "h2"))
+}
+
 /// A code block's verbatim text plus its language (for the fence info string).
 struct Code {
     lang: String,
@@ -236,8 +245,8 @@ struct Code {
 }
 
 /// Renders a chosen root to HTML for html2md: boilerplate dropped, each `<pre>` replaced by a
-/// `<p>SCOURCODE{n}X</p>` placeholder (html2md would mangle whitespace), and the stats used
-/// for root scoring and page_type.
+/// private-use-char placeholder `\u{E000}{n}\u{E001}` (html2md would mangle whitespace), and the
+/// stats used for root scoring and page_type.
 #[derive(Default)]
 struct Render {
     base: Option<url::Url>,
@@ -250,24 +259,43 @@ struct Render {
     links: usize,
     link_depth: u32,
     p_depth: u32,
-    /// Inside article/main, where a `<header>` is content rather than site chrome.
-    content_depth: u32,
+    /// DOM recursion depth; descent stops past MAX_DEPTH to bound the stack.
+    depth: u32,
     /// Inside a `table.infobox`: output stops at this `html` length (facts, not essays).
     infobox_limit: Option<usize>,
+    /// First infobox, buffered so it is emitted after the lead paragraph, not before it.
+    infobox_buf: Option<String>,
+    /// Whether the current table row has already emitted a cell (for the ` | ` separator).
+    row_cell_emitted: bool,
+    /// A class/id-noise block is only dropped when its subtree text is below this (25% of root).
+    noise_threshold: usize,
 }
 
 impl Render {
     fn root(el: ElementRef, base: &url::Url) -> Self {
         let mut r = Self {
             base: Some(base.clone()),
-            content_depth: u32::from(matches!(el.value().name(), "article" | "main")),
+            noise_threshold: subtree_text_len(el) / 4,
             ..Self::default()
         };
         r.children(el);
+        // A deferred infobox with no qualifying lead paragraph still gets emitted, at the end.
+        if let Some(buf) = r.infobox_buf.take() {
+            r.html.push_str(&buf);
+        }
         r
     }
 
     fn children(&mut self, el: ElementRef) {
+        // Deeply nested untrusted HTML (`<div>`×100k) would overflow the stack: past this depth
+        // stop descending and emit the remaining subtree text flat.
+        const MAX_DEPTH: u32 = 400;
+        if self.depth >= MAX_DEPTH {
+            let flat: String = el.text().collect();
+            self.push_text(&flat);
+            return;
+        }
+        self.depth += 1;
         for c in el.children() {
             match c.value() {
                 Node::Text(t) => self.push_text(t),
@@ -278,6 +306,7 @@ impl Render {
                 }
             }
         }
+        self.depth -= 1;
     }
 
     fn push_text(&mut self, t: &str) {
@@ -300,15 +329,34 @@ impl Render {
     fn element(&mut self, el: ElementRef) {
         let e = el.value();
         let name = e.name();
-        if is_skipped(e, name, self.content_depth)
-            || self.infobox_limit.is_some_and(|l| self.html.len() >= l)
-        {
+        if is_skipped(e, name) || self.infobox_limit.is_some_and(|l| self.html.len() >= l) {
             return;
         }
+        // Page-level `<header>` (site chrome) has no section heading; a post header keeps its h1/h2.
+        if name == "header" && !has_heading(el) {
+            return;
+        }
+        // Class/id furniture is dropped only for small blocks; large content-bearing blocks
+        // (a wrapper holding most of the article) are never cut by class name.
+        if !matches!(name, "pre" | "code") && is_class_noise(e) {
+            let st = subtree_text_len(el);
+            if st < MIN_ROOT_TEXT || st < self.noise_threshold {
+                return;
+            }
+        }
+        // Wikipedia infobox: render into a buffer and emit it after the lead paragraph, not before
+        // it, so --max-chars windows still catch the opening sentence. First infobox only.
         if name == "table" && e.classes().any(|c| c == "infobox") {
-            let outer = self.infobox_limit.replace(self.html.len() + INFOBOX_HTML);
+            if self.infobox_buf.is_some() {
+                return;
+            }
+            let mut buf = String::new();
+            std::mem::swap(&mut self.html, &mut buf);
+            let outer = self.infobox_limit.replace(INFOBOX_HTML);
             self.children(el);
             self.infobox_limit = outer;
+            std::mem::swap(&mut self.html, &mut buf);
+            self.infobox_buf = Some(buf);
             return;
         }
         match name {
@@ -328,6 +376,8 @@ impl Render {
                     self.html.push_str("\" alt=\"");
                     escape_into(&mut self.html, alt);
                     self.html.push_str("\">");
+                    // Alt text is real content: count it so an alt-only link/figure isn't rolled back.
+                    self.text += alt.len();
                 }
                 return;
             }
@@ -336,6 +386,7 @@ impl Render {
             "table" | "thead" | "tbody" | "tfoot" | "caption" => return self.children(el),
             "tr" => {
                 self.html.push_str("<p>");
+                self.row_cell_emitted = false;
                 self.children(el);
                 self.html.push_str("</p>");
                 return;
@@ -344,13 +395,10 @@ impl Render {
                 if is_blank(el) {
                     return;
                 }
-                let earlier_cell = el
-                    .prev_siblings()
-                    .filter_map(ElementRef::wrap)
-                    .any(|c| !is_blank(c));
-                if earlier_cell {
+                if self.row_cell_emitted {
                     self.html.push_str(" | ");
                 }
+                self.row_cell_emitted = true;
                 return self.children(el);
             }
             _ => {}
@@ -376,7 +424,6 @@ impl Render {
             return;
         }
         let is_p = name == "p";
-        let is_content = matches!(name, "article" | "main");
         // `<a>` without an href (fragment links like `#heading`) is just its text.
         let href = if name == "a" {
             e.attr("href").and_then(|h| self.abs(h))
@@ -403,10 +450,8 @@ impl Render {
         }
         self.html.push('>');
         self.p_depth += u32::from(is_p);
-        self.content_depth += u32::from(is_content);
         self.children(el);
         self.p_depth -= u32::from(is_p);
-        self.content_depth -= u32::from(is_content);
         if is_link {
             self.link_depth -= 1;
         }
@@ -417,6 +462,13 @@ impl Render {
             return;
         }
         self.html.push_str(&format!("</{out}>"));
+        // Emit the deferred infobox right after the first substantial (>=80 char) paragraph.
+        if is_p
+            && self.text - text_before >= 80
+            && let Some(buf) = self.infobox_buf.take()
+        {
+            self.html.push_str(&buf);
+        }
     }
 
     fn code_block(&mut self, el: ElementRef) {
@@ -435,7 +487,7 @@ impl Render {
             body: body.to_string(),
         });
         self.html
-            .push_str(&format!("<p>SCOURCODE{}X</p>", self.codes.len() - 1));
+            .push_str(&format!("<p>\u{E000}{}\u{E001}</p>", self.codes.len() - 1));
     }
 
     /// Absolute URL for links/images; None for empty, fragment, data:, and javascript: values.
@@ -756,7 +808,7 @@ fn to_markdown(r: &Render, title: &str, links: &[Link]) -> String {
     }
     let mut md = md;
     for (i, c) in r.codes.iter().enumerate() {
-        md = md.replace(&format!("SCOURCODE{i}X"), &fenced(c));
+        md = md.replace(&format!("\u{E000}{i}\u{E001}"), &fenced(c));
     }
     clean_markdown(&md)
 }
@@ -768,7 +820,7 @@ fn fill_html(html: &str, codes: &[Code]) -> String {
         let mut pre = String::from("<pre><code>");
         escape_into(&mut pre, &c.body);
         pre.push_str("</code></pre>");
-        out = out.replace(&format!("<p>SCOURCODE{i}X</p>"), &pre);
+        out = out.replace(&format!("<p>\u{E000}{i}\u{E001}</p>"), &pre);
     }
     out
 }
@@ -964,6 +1016,14 @@ mod tests {
         let md = "日本語   テキスト\n\n\n\n|---|\n中文 ✓   ok";
         assert_eq!(super::clean_markdown(md), "日本語 テキスト\n\n中文 ✓ ok");
     }
+
+    #[test]
+    fn code_placeholder_survives_html2md() {
+        // Private-use sentinel must pass through html2md unchanged so code blocks reinsert cleanly.
+        let s = "\u{E000}0\u{E001}";
+        let md = html2md::parse_html(&format!("<p>{s}</p>"));
+        assert!(md.contains(s), "placeholder mangled by html2md: {md:?}");
+    }
 }
 
 #[cfg(test)]
@@ -1051,8 +1111,8 @@ mod main_content_tests {
     fn pages_lead_with_content_and_keep_their_type() {
         for (html, name, url, phrase, ptype) in PAGES {
             let d = extract(html, url).unwrap();
-            // Wikipedia's infobox is capped but still precedes the lead, so it gets a wider window.
-            let window = if *name == "wikipedia" { 2500 } else { 400 };
+            // Infobox is deferred past the lead, so the opening sentence lands in the first window.
+            let window = if *name == "wikipedia" { 600 } else { 400 };
             let head: String = d.markdown.chars().take(window).collect();
             assert!(
                 head.contains(phrase),
@@ -1146,5 +1206,57 @@ mod main_content_tests {
         assert!(d.markdown.starts_with("# Guide") || d.markdown.contains("Guide\n"));
         assert!(d.markdown.contains("Real body text"));
         assert_eq!(d.title, "Guide");
+    }
+
+    #[test]
+    fn large_content_wrapper_not_dropped_by_class_name() {
+        let body = "This is the real article body text that must survive. ".repeat(30);
+        let html = format!(
+            r#"<html><head><title>Post</title></head><body><article><h1>Title</h1>
+            <div class="sidebar-layout has-toc"><p>{body}</p></div></article></body></html>"#
+        );
+        let d = extract(&html, "https://example.com/post").unwrap();
+        assert!(
+            d.markdown.contains("real article body text"),
+            "content wrapper dropped by class: {}",
+            d.markdown
+        );
+    }
+
+    #[test]
+    fn deeply_nested_html_does_not_overflow() {
+        // Realistic 2MB stack: deep nesting must flatten past the depth cap, not stack-overflow.
+        // Depth 5000 is far beyond the ~1-2k frames a 2MB stack tolerates for the uncapped walker.
+        // (html5ever's own parser is O(depth^2), so 100k would take minutes to *parse*, unrelated
+        // to the walker fix under test.)
+        let handle = std::thread::Builder::new()
+            .stack_size(2 << 20)
+            .spawn(|| {
+                let depth = 5_000;
+                let mut html = String::from("<html><body><article>");
+                html.push_str(&"<div>".repeat(depth));
+                html.push_str(&"deep text here that is long enough to be real content. ".repeat(8));
+                html.push_str(&"</div>".repeat(depth));
+                html.push_str("</article></body></html>");
+                let d = extract(&html, "https://example.com/").unwrap();
+                assert!(d.text.contains("deep text here"), "deep text lost");
+            })
+            .unwrap();
+        handle.join().unwrap();
+    }
+
+    #[test]
+    fn wikipedia_lead_sentence_near_top() {
+        let html = include_str!("../tests/fixtures/extract/wikipedia_rust.html");
+        let d = extract(
+            html,
+            "https://en.wikipedia.org/wiki/Rust_(programming_language)",
+        )
+        .unwrap();
+        let head: String = d.markdown.chars().take(600).collect();
+        assert!(
+            head.contains("general-purpose programming language"),
+            "lead sentence not in first 600 chars: {head:?}"
+        );
     }
 }
